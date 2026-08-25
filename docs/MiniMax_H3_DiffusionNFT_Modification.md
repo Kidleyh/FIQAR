@@ -10,6 +10,41 @@
 
 ## Change history
 
+### 2026-08-25 — phase 1 online rollout and MagFace reward
+
+- **Modification goal:** implement current-policy MiniMax-H3 multi-seed rollout, external MagFace reward evaluation, and `rollout.json` persistence without any model update.
+- **New files:**
+  - `examples/minimax_h3/model_training/diffusionnft/reward_face_quality.py`
+  - `examples/minimax_h3/model_training/diffusionnft/rollout.py`
+  - `examples/minimax_h3/model_training/diffusionnft/smoke_test.sh`
+- **Modified files:** `docs/MiniMax_H3_DiffusionNFT_Modification.md` only.
+- **Core-code changes:** none. Pipeline, DiT, video/audio VAE, scheduler, generic loss/runner, and SFT trainer remain unchanged.
+- **Implementation:**
+  - added a subprocess-only adapter for the existing `eval_video_face_quality.py` evaluator;
+  - adapter accepts generated mp4 paths, batches them through one evaluator invocation, parses `video_quality.jsonl`, and returns records containing `video_path`, `mean_quality`, `face_visible_ratio`, `num_faces`, and `reward`;
+  - a missing/null `mean_quality` maps to configurable `--missing-face-reward` (default `0.0`);
+  - added dataset-record and explicit `--prompt`/`--input-video` rollout modes;
+  - added `--num-samples`, explicit `--seeds`, `--output-dir`, shape/step/current-policy LoRA options, existing-output reuse, and reward sampling controls;
+  - each selected prompt uses one loaded current policy to generate all seeds serially, then the H3 pipeline is released before SCRFD/MagFace start;
+  - final `rollout.json` is a list containing prompt, seed, absolute video path, reward, mean quality, visible ratio, and detected face count.
+- **Tests:**
+  - Python compilation and both CLI help paths passed under the repository `py312` environment;
+  - adapter-only real test on two existing H3 renders passed: rewards `21.8002787431` and `22.6031402747`, visible ratio `1.0` for both, 7 detected faces each;
+  - full current-policy smoke passed with one existing prompt, seeds 0 and 1, 448x256, 22 frames, 1 denoise step, 14GB VRAM limit, and reward frame stride 6;
+  - smoke seed 0: reward `22.3552300135`, mean quality `22.3552300135`, visible ratio `0.75`, 5 detected faces;
+  - smoke seed 1: reward `22.7357590199`, mean quality `22.7357590199`, visible ratio `1.0`, 10 detected faces;
+  - MagFace scored 15 faces across 8 sampled frames and wrote the final `outputs/minimax_h3_diffusionnft_rollout_smoke/rollout.json`.
+- **Current status:** phase 1 complete; online rollout and reward work end to end; no diffusion loss, optimizer, backward pass, or model update exists.
+- **Current limitations:**
+  - H3 generation is serial and expensive; the smoke uses a deliberately non-production 1-step/22-frame setting only to validate integration;
+  - a concurrent long-running H3 job occupied about 60GB GPU memory, so a 39-frame/4-step/14GB attempt was stopped after 12 minutes before seed 0 completed; it did not fail with a code or OOM error;
+  - reward evaluation crosses Conda environments and requires mp4 files on disk;
+  - reward is currently `mean_quality`; face visibility/count are logged but do not alter valid rewards;
+  - no-face behavior is a fixed configurable fallback rather than a learned or composite visibility reward;
+  - samples are processed serially because MiniMax-H3 packed DiT currently requires batch size 1;
+  - `--skip-existing` trusts non-empty existing files; production resume should validate video dimensions/frame count before reuse.
+- **Next step:** add `examples/minimax_h3/model_training/diffusionnft/train.py` as the phase-2 entrypoint for group advantage, generated-sample VAE encoding, forward diffusion, and weighted video diffusion loss. This phase did not create or implement that loss.
+
 ### 2026-08-25 — repository and reward-path audit
 
 - **Modification goal:** determine the smallest viable implementation surface before changing core code.
