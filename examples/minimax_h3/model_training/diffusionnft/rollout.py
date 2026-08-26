@@ -208,6 +208,9 @@ def main() -> None:
                     "prompt": prompt,
                     "seed": seed,
                     "video_path": str(video_path),
+                    "num_inference_steps": args.num_inference_steps,
+                    "flow_shift": args.flow_shift,
+                    "audio_flow_shift": args.audio_flow_shift,
                 }
             )
 

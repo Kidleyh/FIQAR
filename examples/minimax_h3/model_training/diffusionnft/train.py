@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Minimal MiniMax-H3 LoRA diffusion backward and one-step DiffusionNFT.
+"""MiniMax-H3 LoRA diffusion backward and repeatable offline DiffusionNFT updates.
 
 Modes:
 
 * ``backward-smoke`` keeps the Phase-2 weighted FlowMatch MSE smoke.
-* ``nft-step`` reads a same-prompt rollout group, computes the official
-  DiffusionNFT positive/implicit-negative objective plus reference
-  regularization, accumulates serial batch-size-1 gradients, and performs one
-  optimizer step.
+* ``nft-step`` reads a same-prompt rollout group, reconstructs its inference
+  timestep schedule, computes the official DiffusionNFT objective at multiple
+  timesteps, and performs one checkpointable optimizer step.
 
-This file intentionally contains no online rollout loop, multi-GPU support,
-audio reward/loss, checkpointing, or repeated training loop.
+Repeated updates are performed by invoking this entrypoint again with
+``--resume-from``. This file intentionally contains no online rollout loop,
+multi-GPU support, or audio reward/loss.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from PIL import Image
 from peft import LoraConfig, inject_adapter_in_model
 from peft.tuners.tuners_utils import BaseTunerLayer, set_adapter
+from safetensors.torch import load_file, save_file
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -93,6 +94,61 @@ def select_prompt_group(
         if not isinstance(reward, (int, float)) or not math.isfinite(float(reward)):
             raise ValueError(f"Group record {group_index} has invalid reward: {reward}")
     return group
+
+
+def rollout_scheduler_config(group: list[dict[str, Any]]) -> dict[str, int | float]:
+    aliases = {
+        "num_inference_steps": ("num_inference_steps", "render_num_inference_steps"),
+        "flow_shift": ("flow_shift", "render_flow_shift"),
+        "audio_flow_shift": ("audio_flow_shift", "render_audio_flow_shift"),
+    }
+    resolved: dict[str, int | float] = {}
+    for output_key, candidate_keys in aliases.items():
+        values = []
+        for record_index, record in enumerate(group):
+            value = next((record[key] for key in candidate_keys if key in record), None)
+            if value is None:
+                raise ValueError(
+                    f"Rollout record {record_index} is missing {output_key}; regenerate it "
+                    "with the Phase-4 rollout.py so training can reconstruct the exact scheduler"
+                )
+            values.append(value)
+        if any(value != values[0] for value in values[1:]):
+            raise ValueError(f"Same-prompt rollout group has inconsistent {output_key}: {values}")
+        resolved[output_key] = values[0]
+    num_steps = resolved["num_inference_steps"]
+    if not isinstance(num_steps, int) or isinstance(num_steps, bool) or num_steps <= 0:
+        raise ValueError(f"Invalid rollout num_inference_steps: {num_steps}")
+    for key in ("flow_shift", "audio_flow_shift"):
+        value = resolved[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+            raise ValueError(f"Invalid rollout {key}: {value}")
+        resolved[key] = float(value)
+    return resolved
+
+
+def selected_timestep_indices(
+    num_inference_steps: int,
+    timestep_fraction: float,
+    *,
+    shuffle: bool,
+    seed: int,
+) -> list[int]:
+    # Match official DiffusionNFT: train the leading fraction of the rollout's
+    # actual inference schedule. Unlike the former Phase-3 path, there is no
+    # sampling from a separate 1000-step training schedule.
+    count = int(num_inference_steps * timestep_fraction)
+    if count < 1:
+        raise ValueError(
+            f"int(num_inference_steps={num_inference_steps} * "
+            f"timestep_fraction={timestep_fraction}) is zero"
+        )
+    indices = list(range(count))
+    if shuffle:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        permutation = torch.randperm(count, generator=generator).tolist()
+        indices = [indices[index] for index in permutation]
+    return indices
 
 
 def decode_video_frames(path: str | Path) -> tuple[list[Image.Image], float]:
@@ -163,8 +219,12 @@ def named_adapter_parameters(
     ]
 
 
-def add_and_initialize_old_adapter(
-    dit: torch.nn.Module, lora_rank: int, target_modules: str
+def add_old_adapter(
+    dit: torch.nn.Module,
+    lora_rank: int,
+    target_modules: str,
+    *,
+    initialize_from_current: bool,
 ) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     config = LoraConfig(
         r=lora_rank,
@@ -180,14 +240,19 @@ def add_and_initialize_old_adapter(
         )
     old_by_name = {name: parameter for name, parameter in old_named}
     paired_old = []
-    with torch.no_grad():
-        for current_name, current_parameter in current_named:
-            old_name = current_name.replace(".default.", ".old.")
-            if old_name not in old_by_name:
-                raise RuntimeError(f"Missing old adapter parameter for {current_name}")
-            old_parameter = old_by_name[old_name]
-            old_parameter.copy_(current_parameter)
-            paired_old.append(old_parameter)
+    for current_name, current_parameter in current_named:
+        old_name = current_name.replace(".default.", ".old.")
+        if old_name not in old_by_name:
+            raise RuntimeError(f"Missing old adapter parameter for {current_name}")
+        old_parameter = old_by_name[old_name]
+        if initialize_from_current:
+            with torch.no_grad():
+                old_parameter.copy_(current_parameter)
+        # Keep the frozen EMA adapter in fp32. With bf16, the official early
+        # decay values (for example 0.001 at global step 1) round the old state
+        # back to current exactly and destroy the intended policy lag.
+        old_parameter.data = old_parameter.data.float()
+        paired_old.append(old_parameter)
     current = [parameter for _, parameter in current_named]
     # Both adapter copies must be classified as always-on-GPU by the existing
     # offload manager. Old is frozen immediately after manager construction.
@@ -247,7 +312,140 @@ def update_old_policy(
 ) -> None:
     with torch.no_grad():
         for current, old in zip(current_parameters, old_parameters, strict=True):
-            old.copy_(old.detach() * decay + current.detach() * (1.0 - decay))
+            old.copy_(
+                old.detach().float() * decay
+                + current.detach().float() * (1.0 - decay)
+            )
+
+
+def paired_parameter_distance(
+    left: list[torch.nn.Parameter], right: list[torch.nn.Parameter]
+) -> float:
+    squared_distance = 0.0
+    with torch.no_grad():
+        for left_parameter, right_parameter in zip(left, right, strict=True):
+            difference = left_parameter.detach().float() - right_parameter.detach().float()
+            squared_distance += difference.square().sum().item()
+    return math.sqrt(squared_distance)
+
+
+def _rollout_lora_key(parameter_name: str, adapter_name: str) -> str:
+    key = parameter_name.replace(f".lora_A.{adapter_name}.weight", ".lora_A.weight")
+    key = key.replace(f".lora_B.{adapter_name}.weight", ".lora_B.weight")
+    if key == parameter_name:
+        raise ValueError(f"Unable to export adapter parameter name: {parameter_name}")
+    return key
+
+
+def adapter_export_state(dit: torch.nn.Module, adapter_name: str) -> dict[str, torch.Tensor]:
+    return {
+        _rollout_lora_key(name, adapter_name): parameter.detach().cpu().contiguous()
+        for name, parameter in named_adapter_parameters(dit, adapter_name)
+    }
+
+
+def load_adapter_state(dit: torch.nn.Module, adapter_name: str, path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    state = load_file(str(path), device="cpu")
+    named = named_adapter_parameters(dit, adapter_name)
+    expected = {_rollout_lora_key(name, adapter_name) for name, _ in named}
+    if set(state) != expected:
+        missing = sorted(expected - set(state))[:5]
+        unexpected = sorted(set(state) - expected)[:5]
+        raise RuntimeError(
+            f"Adapter checkpoint keys do not match {adapter_name}: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    with torch.no_grad():
+        for name, parameter in named:
+            value = state[_rollout_lora_key(name, adapter_name)]
+            if value.shape != parameter.shape:
+                raise RuntimeError(
+                    f"Adapter tensor shape mismatch for {name}: {value.shape} != {parameter.shape}"
+                )
+            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+
+def checkpoint_config(
+    args: argparse.Namespace, scheduler_config: dict[str, int | float]
+) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "model_id": args.model_id,
+        "lora_rank": args.lora_rank,
+        "lora_target_modules": args.lora_target_modules,
+        "adv_eps": args.adv_eps,
+        "adv_clip_max": args.adv_clip_max,
+        "policy_beta": args.policy_beta,
+        "kl_beta": args.kl_beta,
+        "timestep_fraction": args.timestep_fraction,
+        "shuffle_timesteps": args.shuffle_timesteps,
+        "old_decay_type": args.old_decay_type,
+        "learning_rate": args.learning_rate,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "adam_epsilon": args.adam_epsilon,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        **scheduler_config,
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_checkpoint_state(checkpoint_dir: Path) -> dict[str, Any]:
+    state_path = checkpoint_dir / "training_state.json"
+    if not state_path.is_file():
+        raise FileNotFoundError(state_path)
+    with state_path.open("r", encoding="utf-8") as handle:
+        state = json.load(handle)
+    if not isinstance(state.get("global_step"), int) or state["global_step"] < 0:
+        raise ValueError(f"Invalid checkpoint global_step in {state_path}")
+    if not isinstance(state.get("nft_config"), dict):
+        raise ValueError(f"Missing nft_config in {state_path}")
+    return state
+
+
+def validate_resume_config(saved: dict[str, Any], current: dict[str, Any]) -> None:
+    mismatches = {
+        key: (saved.get(key), value)
+        for key, value in current.items()
+        if saved.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Resume NFT configuration mismatch: {mismatches}")
+
+
+def save_checkpoint(
+    checkpoint_dir: Path,
+    dit: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    nft_config: dict[str, Any],
+) -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    current_state = adapter_export_state(dit, "default")
+    old_state = adapter_export_state(dit, "old")
+    if not current_state or set(current_state) != set(old_state):
+        raise RuntimeError("Current/old LoRA export keys are empty or inconsistent")
+    # current_lora.safetensors intentionally uses the exact key convention
+    # consumed by rollout.py --lora-path / BasePipeline.load_lora.
+    save_file(current_state, str(checkpoint_dir / "current_lora.safetensors"))
+    save_file(old_state, str(checkpoint_dir / "old_lora.safetensors"))
+    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    _write_json_atomic(
+        checkpoint_dir / "training_state.json",
+        {"global_step": global_step, "nft_config": nft_config},
+    )
 
 
 def scheduler_sigma(scheduler, timestep: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -396,7 +594,10 @@ def run_nft_step(
     device: torch.device,
     current_parameters: list[torch.nn.Parameter],
     old_parameters: list[torch.nn.Parameter],
-) -> None:
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    nft_config: dict[str, Any],
+) -> int:
     rewards = torch.tensor([float(record["reward"]) for record in group], dtype=torch.float32)
     reward_mean = rewards.mean()
     reward_std = rewards.std(unbiased=False)
@@ -408,16 +609,37 @@ def run_nft_step(
     print(f"[nft] clipped_advantages={clipped_advantages.tolist()}", flush=True)
     print(f"[nft] r={ratios.tolist()}", flush=True)
 
-    optimizer = torch.optim.AdamW(
-        current_parameters,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_epsilon,
-        weight_decay=args.weight_decay,
-    )
     optimizer.zero_grad(set_to_none=True)
     before_step = [parameter.detach().cpu().float().clone() for parameter in current_parameters]
-    metrics = {key: [] for key in ("positive", "negative", "policy", "kl", "total")}
+    metrics = {
+        key: []
+        for key in (
+            "positive",
+            "negative",
+            "policy",
+            "kl",
+            "total",
+            "current_reference_distance",
+        )
+    }
+    num_inference_steps = int(nft_config["num_inference_steps"])
+    num_train_timesteps = int(num_inference_steps * args.timestep_fraction)
+    total_backward_passes = len(group) * num_train_timesteps
+    current_old_distance_before = paired_parameter_distance(
+        current_parameters, old_parameters
+    )
+    print(
+        f"[step] global_step_before={global_step} samples={len(group)} "
+        f"inference_timesteps={num_inference_steps} "
+        f"training_timesteps_per_sample={num_train_timesteps} "
+        f"total_backward_passes={total_backward_passes}",
+        flush=True,
+    )
+    print(
+        f"[policies] current_old_parameter_distance_before="
+        f"{current_old_distance_before:.12f}",
+        flush=True,
+    )
 
     expected_shape = None
     for sample_index, (record, ratio) in enumerate(zip(group, ratios, strict=True)):
@@ -431,108 +653,133 @@ def run_nft_step(
         # Frozen VAE/text forwards do not participate in backward. Reset the
         # existing hook manager before the three policy forwards.
         offload_manager.after_backward()
-        timestep_id = sample_timestep_id(args, sample_index)
-        validate_timestep(model, timestep_id)
-        x0, x_t, _, timestep_video, timestep_audio, sigma = make_forward_diffusion(
-            model,
-            inputs_shared,
-            timestep_id,
-            args.noise_seed + sample_index,
-            device,
+        timestep_indices = selected_timestep_indices(
+            num_inference_steps,
+            args.timestep_fraction,
+            shuffle=args.shuffle_timesteps,
+            seed=args.timestep_seed + global_step * 100_003 + sample_index,
         )
-
-        set_policy_adapter(model.pipe.dit, "old", trainable=False)
-        with torch.no_grad():
-            old_prediction = model_velocity(
-                model,
-                inputs_shared,
-                inputs_posi,
-                x_t,
-                timestep_video,
-                timestep_audio,
-                checkpoint=False,
-            ).detach()
-        offload_manager.after_backward()
-
-        disable_all_adapters(model.pipe.dit)
-        with torch.no_grad():
-            reference_prediction = model_velocity(
-                model,
-                inputs_shared,
-                inputs_posi,
-                x_t,
-                timestep_video,
-                timestep_audio,
-                checkpoint=False,
-            ).detach()
-        offload_manager.after_backward()
-
-        enable_current_adapter(model.pipe.dit)
-        current_prediction = model_velocity(
-            model,
-            inputs_shared,
-            inputs_posi,
-            x_t,
-            timestep_video,
-            timestep_audio,
-            checkpoint=True,
-        )
-
-        positive_prediction = (
-            args.policy_beta * current_prediction
-            + (1.0 - args.policy_beta) * old_prediction
-        )
-        implicit_negative_prediction = (
-            (1.0 + args.policy_beta) * old_prediction
-            - args.policy_beta * current_prediction
-        )
-        sigma_expanded = sigma.view(*([1] * x0.ndim))
-        positive_x0 = x_t - sigma_expanded * positive_prediction
-        negative_x0 = x_t - sigma_expanded * implicit_negative_prediction
-        reduce_dims = tuple(range(1, x0.ndim))
-        with torch.no_grad():
-            positive_weight = (
-                (positive_x0.double() - x0.double())
-                .abs()
-                .mean(dim=reduce_dims, keepdim=True)
-                .clamp(min=1e-5)
-            )
-            negative_weight = (
-                (negative_x0.double() - x0.double())
-                .abs()
-                .mean(dim=reduce_dims, keepdim=True)
-                .clamp(min=1e-5)
-            )
-        positive_loss = (
-            (positive_x0 - x0).square() / positive_weight
-        ).mean(dim=reduce_dims)
-        negative_loss = (
-            (negative_x0 - x0).square() / negative_weight
-        ).mean(dim=reduce_dims)
-        original_policy_loss = (
-            ratio.to(device) * positive_loss / args.policy_beta
-            + (1.0 - ratio.to(device)) * negative_loss / args.policy_beta
-        )
-        policy_loss = (original_policy_loss * args.adv_clip_max).mean()
-        kl_loss = F.mse_loss(current_prediction.float(), reference_prediction.float())
-        total_loss = policy_loss + args.kl_beta * kl_loss
-        (total_loss / len(group)).backward()
-        metrics["positive"].append(positive_loss.detach().mean().float().cpu())
-        metrics["negative"].append(negative_loss.detach().mean().float().cpu())
-        metrics["policy"].append(policy_loss.detach().float().cpu())
-        metrics["kl"].append(kl_loss.detach().float().cpu())
-        metrics["total"].append(total_loss.detach().float().cpu())
         print(
-            f"[sample {sample_index}] seed={record.get('seed')} reward={float(record['reward']):.8f} "
-            f"advantage={float(advantages[sample_index]):.8f} r={float(ratio):.8f} "
-            f"timestep_id={timestep_id} sigma={float(sigma):.8f} "
-            f"positive_loss={positive_loss.mean().item():.8f} "
-            f"negative_loss={negative_loss.mean().item():.8f} "
-            f"policy_loss={policy_loss.item():.8f} kl_loss={kl_loss.item():.8f} "
-            f"total_loss={total_loss.item():.8f}",
+            f"[sample {sample_index}] seed={record.get('seed')} "
+            f"timestep_indices={timestep_indices}",
             flush=True,
         )
-        offload_manager.after_backward()
+        for timestep_position, timestep_id in enumerate(timestep_indices):
+            validate_timestep(model, timestep_id)
+            noise_seed = (
+                args.noise_seed
+                + global_step * 1_000_003
+                + sample_index * num_inference_steps
+                + timestep_id
+            )
+            x0, x_t, _, timestep_video, timestep_audio, sigma = make_forward_diffusion(
+                model,
+                inputs_shared,
+                timestep_id,
+                noise_seed,
+                device,
+            )
+
+            set_policy_adapter(model.pipe.dit, "old", trainable=False)
+            with torch.no_grad():
+                old_prediction = model_velocity(
+                    model,
+                    inputs_shared,
+                    inputs_posi,
+                    x_t,
+                    timestep_video,
+                    timestep_audio,
+                    checkpoint=False,
+                ).detach()
+            offload_manager.after_backward()
+
+            disable_all_adapters(model.pipe.dit)
+            with torch.no_grad():
+                reference_prediction = model_velocity(
+                    model,
+                    inputs_shared,
+                    inputs_posi,
+                    x_t,
+                    timestep_video,
+                    timestep_audio,
+                    checkpoint=False,
+                ).detach()
+            offload_manager.after_backward()
+
+            enable_current_adapter(model.pipe.dit)
+            current_prediction = model_velocity(
+                model,
+                inputs_shared,
+                inputs_posi,
+                x_t,
+                timestep_video,
+                timestep_audio,
+                checkpoint=True,
+            )
+
+            positive_prediction = (
+                args.policy_beta * current_prediction
+                + (1.0 - args.policy_beta) * old_prediction
+            )
+            implicit_negative_prediction = (
+                (1.0 + args.policy_beta) * old_prediction
+                - args.policy_beta * current_prediction
+            )
+            sigma_expanded = sigma.view(*([1] * x0.ndim))
+            positive_x0 = x_t - sigma_expanded * positive_prediction
+            negative_x0 = x_t - sigma_expanded * implicit_negative_prediction
+            reduce_dims = tuple(range(1, x0.ndim))
+            with torch.no_grad():
+                positive_weight = (
+                    (positive_x0.double() - x0.double())
+                    .abs()
+                    .mean(dim=reduce_dims, keepdim=True)
+                    .clamp(min=1e-5)
+                )
+                negative_weight = (
+                    (negative_x0.double() - x0.double())
+                    .abs()
+                    .mean(dim=reduce_dims, keepdim=True)
+                    .clamp(min=1e-5)
+                )
+            positive_loss = (
+                (positive_x0 - x0).square() / positive_weight
+            ).mean(dim=reduce_dims)
+            negative_loss = (
+                (negative_x0 - x0).square() / negative_weight
+            ).mean(dim=reduce_dims)
+            original_policy_loss = (
+                ratio.to(device) * positive_loss / args.policy_beta
+                + (1.0 - ratio.to(device)) * negative_loss / args.policy_beta
+            )
+            policy_loss = (original_policy_loss * args.adv_clip_max).mean()
+            kl_loss = F.mse_loss(
+                current_prediction.float(), reference_prediction.float()
+            )
+            current_reference_distance = math.sqrt(max(kl_loss.item(), 0.0))
+            total_loss = policy_loss + args.kl_beta * kl_loss
+            (total_loss / total_backward_passes).backward()
+            metrics["positive"].append(positive_loss.detach().mean().float().cpu())
+            metrics["negative"].append(negative_loss.detach().mean().float().cpu())
+            metrics["policy"].append(policy_loss.detach().float().cpu())
+            metrics["kl"].append(kl_loss.detach().float().cpu())
+            metrics["total"].append(total_loss.detach().float().cpu())
+            metrics["current_reference_distance"].append(
+                torch.tensor(current_reference_distance)
+            )
+            print(
+                f"[sample {sample_index} timestep {timestep_position}] "
+                f"seed={record.get('seed')} reward={float(record['reward']):.8f} "
+                f"advantage={float(advantages[sample_index]):.8f} r={float(ratio):.8f} "
+                f"timestep_id={timestep_id} timestep={float(timestep_video):.8f} "
+                f"sigma={float(sigma):.8f} positive_loss={positive_loss.mean().item():.8f} "
+                f"negative_loss={negative_loss.mean().item():.8f} "
+                f"policy_loss={policy_loss.item():.8f} kl_loss={kl_loss.item():.8f} "
+                f"current_reference_prediction_distance={current_reference_distance:.8f} "
+                f"total_loss={total_loss.item():.8f}",
+                flush=True,
+            )
+            offload_manager.after_backward()
 
     old_policy_no_grad = no_adapter_has_grad(model.pipe.dit, "old")
     reference_policy_no_grad = not frozen_base_has_grad(model.pipe.dit)
@@ -541,14 +788,19 @@ def run_nft_step(
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     delta = parameter_delta(before_step, current_parameters)
-    decay = official_return_decay(args.old_decay_step, args.old_decay_type)
+    global_step += 1
+    decay = official_return_decay(global_step, args.old_decay_type)
     update_old_policy(current_parameters, old_parameters, decay)
+    current_old_distance_after = paired_parameter_distance(
+        current_parameters, old_parameters
+    )
 
     means = {key: torch.stack(values).mean().item() for key, values in metrics.items()}
     print(
         f"[group] positive_loss={means['positive']:.8f} negative_loss={means['negative']:.8f} "
         f"policy_loss={means['policy']:.8f} kl_loss={means['kl']:.8f} "
-        f"total_loss={means['total']:.8f}",
+        f"current_reference_prediction_distance="
+        f"{means['current_reference_distance']:.8f} total_loss={means['total']:.8f}",
         flush=True,
     )
     print(
@@ -559,8 +811,9 @@ def run_nft_step(
     print(
         f"[policies] old_policy_no_grad={str(old_policy_no_grad).lower()} "
         f"reference_policy_no_grad={str(reference_policy_no_grad).lower()} "
-        f"old_decay_type={args.old_decay_type} old_decay_step={args.old_decay_step} "
-        f"old_decay={decay:.8f}",
+        f"old_decay_type={args.old_decay_type} decay_global_step={global_step} "
+        f"old_decay={decay:.8f} current_old_parameter_distance_after="
+        f"{current_old_distance_after:.12f}",
         flush=True,
     )
     print(f"[optimizer] current_parameter_delta={delta:.12f}", flush=True)
@@ -576,11 +829,29 @@ def run_nft_step(
         raise RuntimeError("Old policy unexpectedly received gradients")
     if not reference_policy_no_grad:
         raise RuntimeError("Reference/base policy unexpectedly received gradients")
-    print("[done] optimizer_step=true", flush=True)
+    checkpoint_path = None
+    if args.checkpoint_output is not None:
+        checkpoint_path = args.checkpoint_output.expanduser().resolve()
+        save_checkpoint(
+            checkpoint_path,
+            model.pipe.dit,
+            optimizer,
+            global_step,
+            nft_config,
+        )
+        print(f"[checkpoint] path={checkpoint_path}", flush=True)
+    print(
+        f"[step] global_step_after={global_step} optimizer_step=true "
+        f"checkpoint={checkpoint_path}",
+        flush=True,
+    )
+    return global_step
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MiniMax-H3 LoRA backward or one-step DiffusionNFT.")
+    parser = argparse.ArgumentParser(
+        description="MiniMax-H3 LoRA backward or checkpointable DiffusionNFT update."
+    )
     parser.add_argument("--mode", choices=("backward-smoke", "nft-step"), default="backward-smoke")
     parser.add_argument("--rollout-json", type=Path, default=DEFAULT_ROLLOUT_JSON)
     parser.add_argument("--rollout-index", type=int, default=0)
@@ -592,6 +863,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep-id", type=int, default=None)
     parser.add_argument("--timestep-seed", type=int, default=1234)
     parser.add_argument("--noise-seed", type=int, default=5678)
+    parser.add_argument("--timestep-fraction", type=float, default=0.99)
+    parser.add_argument(
+        "--shuffle-timesteps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--cpu-offload-split-threshold-mb", type=int, default=None)
     parser.add_argument("--use-gradient-checkpointing-offload", action="store_true")
     parser.add_argument("--adv-eps", type=float, default=1e-4)
@@ -605,7 +882,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--old-decay-type", type=int, choices=(0, 1, 2), default=1)
-    parser.add_argument("--old-decay-step", type=int, default=1)
+    parser.add_argument("--resume-from", type=Path, default=None)
+    parser.add_argument("--checkpoint-output", type=Path, default=None)
     parser.add_argument("--allow-download", action="store_true")
     return parser.parse_args()
 
@@ -624,12 +902,19 @@ def validate_args(args: argparse.Namespace) -> None:
         "policy-beta": args.policy_beta,
         "learning-rate": args.learning_rate,
         "max-grad-norm": args.max_grad_norm,
+        "timestep-fraction": args.timestep_fraction,
     }
     for name, value in positive_values.items():
         if value <= 0:
             raise ValueError(f"--{name} must be positive")
-    if args.kl_beta < 0 or args.weight_decay < 0 or args.old_decay_step < 0:
-        raise ValueError("KL beta, weight decay, and old decay step must be non-negative")
+    if args.timestep_fraction > 1:
+        raise ValueError("--timestep-fraction must be in (0, 1]")
+    if args.kl_beta < 0 or args.weight_decay < 0:
+        raise ValueError("KL beta and weight decay must be non-negative")
+    if args.mode != "nft-step" and (
+        args.resume_from is not None or args.checkpoint_output is not None
+    ):
+        raise ValueError("Checkpoint save/resume is supported only in --mode nft-step")
     if (
         args.cpu_offload_split_threshold_mb is not None
         and args.cpu_offload_split_threshold_mb <= 0
@@ -650,6 +935,28 @@ def main() -> None:
         if args.mode == "nft-step"
         else [select_rollout_record(records, args.rollout_index)]
     )
+    scheduler_config: dict[str, int | float] = {}
+    nft_config: dict[str, Any] = {}
+    resume_dir = None
+    resume_state = None
+    global_step = 0
+    if args.mode == "nft-step":
+        scheduler_config = rollout_scheduler_config(selected)
+        # Validate the official leading-fraction selection before loading H3.
+        selected_timestep_indices(
+            int(scheduler_config["num_inference_steps"]),
+            args.timestep_fraction,
+            shuffle=False,
+            seed=args.timestep_seed,
+        )
+        nft_config = checkpoint_config(args, scheduler_config)
+        if args.resume_from is not None:
+            resume_dir = args.resume_from.expanduser().resolve()
+            if not resume_dir.is_dir():
+                raise FileNotFoundError(resume_dir)
+            resume_state = read_checkpoint_state(resume_dir)
+            validate_resume_config(resume_state["nft_config"], nft_config)
+            global_step = int(resume_state["global_step"])
     if not args.allow_download:
         os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "True"
     torch.cuda.set_device(device)
@@ -680,16 +987,45 @@ def main() -> None:
         device="cpu",
         task="sft",
     )
-    model.pipe.scheduler.set_timesteps(1000, training=True)
-    model.pipe.scheduler_audio.set_timesteps(1000, training=True)
+    if args.mode == "nft-step":
+        model.pipe.scheduler.set_timesteps(
+            int(scheduler_config["num_inference_steps"]),
+            shift=float(scheduler_config["flow_shift"]),
+            training=True,
+        )
+        model.pipe.scheduler_audio.set_timesteps(
+            int(scheduler_config["num_inference_steps"]),
+            shift=float(scheduler_config["audio_flow_shift"]),
+            training=True,
+        )
+        print(
+            f"[scheduler] num_inference_steps={scheduler_config['num_inference_steps']} "
+            f"flow_shift={scheduler_config['flow_shift']} "
+            f"audio_flow_shift={scheduler_config['audio_flow_shift']} "
+            f"video_timesteps={model.pipe.scheduler.timesteps.tolist()}",
+            flush=True,
+        )
+    else:
+        model.pipe.scheduler.set_timesteps(1000, training=True)
+        model.pipe.scheduler_audio.set_timesteps(1000, training=True)
     current_parameters = [
         parameter for _, parameter in named_adapter_parameters(model.pipe.dit, "default")
     ]
     old_parameters: list[torch.nn.Parameter] = []
     if args.mode == "nft-step":
-        current_parameters, old_parameters = add_and_initialize_old_adapter(
-            model.pipe.dit, args.lora_rank, args.lora_target_modules
+        current_parameters, old_parameters = add_old_adapter(
+            model.pipe.dit,
+            args.lora_rank,
+            args.lora_target_modules,
+            initialize_from_current=resume_dir is None,
         )
+        if resume_dir is not None:
+            load_adapter_state(
+                model.pipe.dit, "default", resume_dir / "current_lora.safetensors"
+            )
+            load_adapter_state(
+                model.pipe.dit, "old", resume_dir / "old_lora.safetensors"
+            )
     if not current_parameters:
         raise RuntimeError("LoRA injection produced zero current-policy parameters")
     model.pipe.device = str(device)
@@ -715,6 +1051,31 @@ def main() -> None:
         )
 
     if args.mode == "nft-step":
+        optimizer = torch.optim.AdamW(
+            current_parameters,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_epsilon,
+            weight_decay=args.weight_decay,
+        )
+        if resume_dir is not None:
+            optimizer_path = resume_dir / "optimizer.pt"
+            if not optimizer_path.is_file():
+                raise FileNotFoundError(optimizer_path)
+            optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location=device, weights_only=True)
+            )
+            print(
+                f"[resume] path={resume_dir} resume_success=true "
+                f"global_step={global_step} current_old_parameter_distance="
+                f"{paired_parameter_distance(current_parameters, old_parameters):.12f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[resume] path=None resume_success=false global_step={global_step}",
+                flush=True,
+            )
         run_nft_step(
             model,
             offload_manager,
@@ -723,6 +1084,9 @@ def main() -> None:
             device,
             current_parameters,
             old_parameters,
+            optimizer,
+            global_step,
+            nft_config,
         )
     else:
         run_backward_smoke(

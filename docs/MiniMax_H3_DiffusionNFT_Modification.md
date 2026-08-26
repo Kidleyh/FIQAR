@@ -10,6 +10,55 @@
 
 ## Change history
 
+### 2026-08-26 — phase 4 repeated multi-timestep DiffusionNFT updates
+
+- **Modification goal:** replace the Phase-3 random 1000-step single-timestep NFT path with rollout-schedule multi-timestep training, then persist and resume current/old LoRA, optimizer, and `global_step` across real updates. Online rollout-training iteration remains out of scope.
+- **Modified files:**
+  - `examples/minimax_h3/model_training/diffusionnft/train.py`;
+  - `examples/minimax_h3/model_training/diffusionnft/rollout.py`;
+  - `examples/minimax_h3/model_training/diffusionnft/smoke_nft_step.sh` (removed the obsolete fixed decay-step argument and pointed it at scheduler-aware rollout data).
+- **New file:** `examples/minimax_h3/model_training/diffusionnft/smoke_nft_2step.sh`.
+- **Rollout scheduler metadata:** every new rollout record now stores `num_inference_steps`, `flow_shift`, and `audio_flow_shift`. NFT training requires these values to exist and agree across the same-prompt group; it does not silently guess values for legacy rollout files.
+- **Multi-timestep implementation:**
+  - video/audio `FlowMatchScheduler` instances are rebuilt with the rollout's actual inference step count and respective shifts;
+  - the resulting inference `timesteps`/`sigmas` are unchanged, while `training=True` is set through the existing scheduler API so the existing H3 input units produce clean VAE latents;
+  - formal NFT training uses the leading `int(num_inference_steps * timestep_fraction)` schedule entries, matching official DiffusionNFT; `--timestep-fraction` defaults to `0.99` and a zero selected count is rejected;
+  - timestep order is independently shuffleable per sample and global step (`--shuffle-timesteps` / `--no-shuffle-timesteps`);
+  - H3 remains batch size 1: each sample and selected timestep is forwarded serially, every loss is divided by `group_size * selected_timestep_count`, and all gradients are accumulated before one optimizer step;
+  - the previous 1000-step random single-timestep route remains only in `--mode backward-smoke`, not the NFT policy path.
+- **Checkpoint format:** each checkpoint directory contains:
+  - `current_lora.safetensors`: rollout-compatible current LoRA keys such as `blocks.0.attn.out_proj.lora_A.weight`;
+  - `old_lora.safetensors`: frozen old-policy LoRA;
+  - `optimizer.pt`: AdamW state;
+  - `training_state.json`: `global_step` plus model, LoRA, reward/loss, scheduler, timestep, optimizer, clipping, and decay configuration.
+- **Resume behavior:** `--resume-from` validates the saved NFT configuration, loads current and old from separate files, restores optimizer state and `global_step`, and does not execute the first-step old=current initialization. The reference remains the adapter-disabled base H3 and is not saved.
+- **Old-policy precision and update:** frozen old LoRA is kept in fp32 and EMA arithmetic casts current to fp32 before applying `old = decay * old + (1-decay) * current`. This preserves the official small early decay values that would otherwise round away in bf16. Decay is computed from the incremented real `global_step`; no manually fixed decay step remains.
+- **Real test rollout:** same source prompt and seeds 0/1, 22 frames at 448x256, 3 inference steps, video flow shift 12, audio flow shift 3. MagFace rewards were `21.59431569` and `21.51016061`. With fraction `0.99`, each sample trained schedule indices 0 and 1 (`sigma=1.0` and `0.96`), giving 2 timesteps per sample and 4 normalized backward passes per optimizer step.
+- **Real two-process smoke command:** `RUN_ID=phase4_final_20260826 bash examples/minimax_h3/model_training/diffusionnft/smoke_nft_2step.sh`.
+- **Step 1 result (`global_step 0 -> 1`):**
+  - shuffled timestep order `[1, 0]` for both samples;
+  - group positive/negative/policy loss `2.23898125 / 2.23898125 / 11.19490623`;
+  - KL and current/reference prediction distance `0 / 0`, expected before the first update;
+  - gradient norm `0.12542670`; all 208 current LoRA tensors received gradients;
+  - current parameter delta `0.235796341397`;
+  - official type-1 decay at real step 1: `0.001`; post-update current/old distance `0.000235790816`;
+  - saved `outputs/minimax_h3_diffusionnft_phase4_2step/phase4_final_20260826/checkpoint-1`.
+- **Step 2 resume result (`global_step 1 -> 2`):**
+  - `resume_success=true`; restored pre-step current/old distance exactly `0.000235790816`, proving current and old were not reinitialized or overwritten;
+  - group positive/negative/policy loss `2.28660250 / 2.27989721 / 11.41664600`;
+  - group KL `0.00579755` and current/reference prediction distance `0.06821136`, so reference regularization is no longer identically zero;
+  - gradient norm `0.11655332`; current parameter delta `0.197328707721`;
+  - official type-1 decay at real step 2: `0.002`; post-update current/old distance `0.000394891737`;
+  - saved `outputs/minimax_h3_diffusionnft_phase4_2step/phase4_final_20260826/checkpoint-2`; final `optimizer_step=true` and `global_step=2`.
+- **Checkpoint verification:** checkpoint 1/2 record global steps 1/2 and optimizer state steps 1/2. Each current and old file contains the same 208 LoRA keys; current is bf16 and old EMA is fp32. Loading checkpoint-2 `current_lora.safetensors` through the exact existing rollout pipeline path patched 104 H3 DiT modules (`load_success=true`).
+- **Problems encountered:**
+  - rebuilding the scheduler without its training flag made the existing H3 video input unit skip clean-latent encoding; enabling `training=True` through `set_timesteps` retained the exact inference schedule and fixed the input path without core changes;
+  - keeping old LoRA in bf16 rounded decay `0.001` to current exactly; moving only frozen old LoRA and EMA arithmetic to fp32 preserved policy lag;
+  - multiplying bf16 current directly by Python scalar `0.999` also rounded before promotion; explicitly converting current to fp32 before both EMA products restored the exact convex update.
+- **Core-code changes:** none. MiniMax-H3 pipeline, DiT, VAE, scheduler implementation, SFT trainer, and common training framework remain unchanged.
+- **Current status:** phase 4 complete. Two real multi-timestep optimizer updates passed across a process restart with persistent current/old/reference state relationships, nonzero second-step KL, and rollout-compatible LoRA export.
+- **Next step:** build a bounded online generate/reward/train orchestration layer around the checkpointable offline update, then add production checkpoint retention and failure recovery. Multi-GPU and audio reward/loss remain deferred.
+
 ### 2026-08-26 — phase 3 one-step LoRA DiffusionNFT update
 
 - **Modification goal:** consume an existing same-prompt rollout group and complete one real `reward -> group advantage -> positive/implicit-negative DiffusionNFT objective -> reference regularization -> backward -> optimizer.step()` update on MiniMax-H3 LoRA.
