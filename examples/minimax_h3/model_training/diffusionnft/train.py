@@ -21,7 +21,9 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +133,53 @@ def validate_nft_rollout_artifacts(group: list[dict[str, Any]]) -> None:
             raise ValueError(f"Invalid H3 rollout geometry: {geometry}")
         if record["num_frames"] < 5 or (record["num_frames"] - 5) % 17:
             raise ValueError(f"Invalid H3 rollout frame count: {record['num_frames']}")
+
+
+def validate_rollout_policy_provenance(
+    group: list[dict[str, Any]],
+    resume_dir: Path | None,
+    global_step: int,
+) -> None:
+    expected_role = "base" if resume_dir is None else "old"
+    expected_lora = None
+    expected_sha256 = None
+    expected_checkpoint = None
+    if resume_dir is not None:
+        expected_checkpoint = resume_dir.resolve()
+        expected_lora = (expected_checkpoint / "old_lora.safetensors").resolve()
+        if not expected_lora.is_file():
+            raise FileNotFoundError(expected_lora)
+        expected_sha256 = _sha256(expected_lora)
+    for index, record in enumerate(group):
+        role = record.get("policy_role")
+        lora_value = record.get("policy_lora_path")
+        sha256 = record.get("policy_lora_sha256")
+        checkpoint_value = record.get("source_checkpoint")
+        step = record.get("global_step_before")
+        actual_lora = Path(lora_value).expanduser().resolve() if lora_value else None
+        actual_checkpoint = (
+            Path(checkpoint_value).expanduser().resolve() if checkpoint_value else None
+        )
+        actual = (role, actual_lora, sha256, actual_checkpoint, step)
+        expected = (
+            expected_role,
+            expected_lora,
+            expected_sha256,
+            expected_checkpoint,
+            global_step,
+        )
+        if actual != expected:
+            raise ValueError(
+                f"Rollout policy provenance mismatch at record {index}: "
+                f"actual={actual} expected={expected}"
+            )
+    print(
+        f"[provenance] rollout_policy_role={expected_role} "
+        f"rollout_policy_sha256={expected_sha256} "
+        f"source_checkpoint={expected_checkpoint} "
+        f"global_step_before={global_step} policy_match=true",
+        flush=True,
+    )
 
 
 def load_rollout_clean_state(
@@ -518,20 +567,31 @@ def save_checkpoint(
     global_step: int,
     nft_config: dict[str, Any],
 ) -> None:
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if checkpoint_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite checkpoint: {checkpoint_dir}")
+    checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary = checkpoint_dir.with_name(
+        f".{checkpoint_dir.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     current_state = adapter_export_state(dit, "default")
     old_state = adapter_export_state(dit, "old")
     if not current_state or set(current_state) != set(old_state):
         raise RuntimeError("Current/old LoRA export keys are empty or inconsistent")
-    # current_lora.safetensors intentionally uses the exact key convention
-    # consumed by rollout.py --lora-path / BasePipeline.load_lora.
-    save_file(current_state, str(checkpoint_dir / "current_lora.safetensors"))
-    save_file(old_state, str(checkpoint_dir / "old_lora.safetensors"))
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
-    _write_json_atomic(
-        checkpoint_dir / "training_state.json",
-        {"global_step": global_step, "nft_config": nft_config},
-    )
+    temporary.mkdir()
+    try:
+        # current_lora.safetensors intentionally uses the exact key convention
+        # consumed by rollout.py --lora-path / BasePipeline.load_lora.
+        save_file(current_state, str(temporary / "current_lora.safetensors"))
+        save_file(old_state, str(temporary / "old_lora.safetensors"))
+        torch.save(optimizer.state_dict(), temporary / "optimizer.pt")
+        _write_json_atomic(
+            temporary / "training_state.json",
+            {"global_step": global_step, "nft_config": nft_config},
+        )
+        temporary.replace(checkpoint_dir)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def scheduler_sigma(scheduler, timestep: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -1065,6 +1125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--old-decay-type", type=int, choices=(0, 1, 2), default=1)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--checkpoint-output", type=Path, default=None)
+    parser.add_argument("--require-policy-provenance", action="store_true")
     parser.add_argument("--allow-download", action="store_true")
     return parser.parse_args()
 
@@ -1139,6 +1200,8 @@ def main() -> None:
             resume_state = read_checkpoint_state(resume_dir)
             validate_resume_config(resume_state["nft_config"], nft_config)
             global_step = int(resume_state["global_step"])
+        if args.require_policy_provenance:
+            validate_rollout_policy_provenance(selected, resume_dir, global_step)
     if not args.allow_download:
         os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "True"
     torch.cuda.set_device(device)

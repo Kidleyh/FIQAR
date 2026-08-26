@@ -78,6 +78,58 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _resolve_policy_provenance(args: argparse.Namespace) -> dict[str, Any]:
+    lora_path = (
+        args.lora_path.expanduser().resolve() if args.lora_path is not None else None
+    )
+    source_checkpoint = (
+        args.source_checkpoint.expanduser().resolve()
+        if args.source_checkpoint is not None
+        else None
+    )
+    if lora_path is not None and not lora_path.is_file():
+        raise FileNotFoundError(lora_path)
+    actual_sha256 = _sha256(lora_path) if lora_path is not None else None
+    if args.policy_lora_sha256 is not None and args.policy_lora_sha256 != actual_sha256:
+        raise ValueError(
+            "--policy-lora-sha256 does not match --lora-path: "
+            f"expected={args.policy_lora_sha256} actual={actual_sha256}"
+        )
+    if args.policy_role == "base":
+        if lora_path is not None or source_checkpoint is not None:
+            raise ValueError("Base-policy rollout cannot use LoRA or a source checkpoint")
+        if args.global_step_before != 0:
+            raise ValueError("Base-policy rollout requires --global-step-before 0")
+    elif args.policy_role == "old":
+        if lora_path is None or source_checkpoint is None:
+            raise ValueError("Old-policy rollout requires --lora-path and --source-checkpoint")
+        if args.global_step_before is None or args.global_step_before <= 0:
+            raise ValueError("Old-policy rollout requires a positive --global-step-before")
+        expected_old = (source_checkpoint / "old_lora.safetensors").resolve()
+        if lora_path != expected_old:
+            raise ValueError(
+                f"Old-policy LoRA must be the source checkpoint old adapter: {expected_old}"
+            )
+    elif any(
+        value is not None
+        for value in (
+            args.policy_lora_sha256,
+            args.source_checkpoint,
+            args.global_step_before,
+        )
+    ):
+        raise ValueError("Policy provenance fields require --policy-role base or old")
+    return {
+        "policy_role": args.policy_role,
+        "policy_lora_path": str(lora_path) if lora_path is not None else None,
+        "policy_lora_sha256": actual_sha256,
+        "source_checkpoint": (
+            str(source_checkpoint) if source_checkpoint is not None else None
+        ),
+        "global_step_before": args.global_step_before,
+    }
+
+
 def _resolve_seeds(num_samples: int | None, seeds: list[int] | None) -> list[int]:
     if seeds is not None:
         if not seeds:
@@ -136,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--lora-path", type=Path, default=None)
     parser.add_argument("--lora-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--policy-role", choices=("unspecified", "base", "old"), default="unspecified"
+    )
+    parser.add_argument("--policy-lora-sha256", default=None)
+    parser.add_argument("--source-checkpoint", type=Path, default=None)
+    parser.add_argument("--global-step-before", type=int, default=None)
     parser.add_argument("--reward-evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--reward-python", default=sys.executable)
     parser.add_argument("--conda-executable", default="/root/miniconda3/bin/conda")
@@ -156,6 +214,7 @@ def main() -> None:
     validate_requested_frames(args.num_frames)
     seeds = _resolve_seeds(args.num_samples, args.seeds)
     records = _resolve_records(args)
+    policy_provenance = _resolve_policy_provenance(args)
     if not records:
         raise RuntimeError("No rollout records were selected")
 
@@ -258,6 +317,7 @@ def main() -> None:
                     "width": render_width,
                     "num_frames": frame_count,
                     "fps": H3_FPS,
+                    **policy_provenance,
                     "num_inference_steps": args.num_inference_steps,
                     "flow_shift": args.flow_shift,
                     "audio_flow_shift": args.audio_flow_shift,
