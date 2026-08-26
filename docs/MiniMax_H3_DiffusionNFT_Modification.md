@@ -10,6 +10,44 @@
 
 ## Change history
 
+### 2026-08-26 — phase 2 minimal LoRA training forward/backward
+
+- **Modification goal:** verify one generated MiniMax-H3 video can traverse VAE encode -> forward diffusion -> H3 DiT prediction -> diffusion MSE -> `backward()` without reward weighting or a model update.
+- **New files:**
+  - `examples/minimax_h3/model_training/diffusionnft/train.py`
+  - `examples/minimax_h3/model_training/diffusionnft/smoke_train.sh`
+- **Modified files:** `docs/MiniMax_H3_DiffusionNFT_Modification.md` only.
+- **Core-code changes:** none. Pipeline, DiT, video/audio VAE, scheduler, generic loss/runner, SFT trainer, rollout, and reward adapter remain unchanged.
+- **`train.py` structure:**
+  1. Read one record from a list-style `rollout.json` (also accepts an object with a `rollouts` list).
+  2. Decode the selected mp4 with OpenCV into RGB PIL frames and validate one video, 24fps, spatial divisibility by 32, and `17n+5` frame count.
+  3. Dynamically load the existing `MiniMaxH3TrainingModule` from `examples/minimax_h3/model_training/train.py` rather than duplicating its model/LoRA setup.
+  4. Instantiate the existing module on CPU with FL2VA text encoder, transformer, video VAE, audio VAE, processor, gradient checkpointing, and PEFT LoRA on DiT `qkv_proj,out_proj`.
+  5. Use the existing `OffloadTrainingManager` in its default leaf-module mode to onload frozen weights around forward/recomputation/backward while LoRA parameters remain on one GPU.
+  6. Run the existing MiniMax-H3 pipeline units, including `MiniMaxH3Unit_InputVideoEmbedder`/`video_vae.encode_video`, prompt embedding, noise initialization, and packed-sequence construction.
+  7. Reset both existing FlowMatch schedulers to 1000-step training mode, sample one timestep and video noise, then call `scheduler.add_noise()` and `scheduler.training_target()`.
+  8. Call the existing `model_fn_minimax_h3` through `model.pipe.model_fn`, compute video MSE times the existing scheduler training weight, call `loss.backward()`, and report LoRA gradient norm.
+  9. Explicitly stop without constructing an optimizer or calling `optimizer.step()`.
+- **Existing components reused:** `MiniMaxH3TrainingModule`, `model_fn_minimax_h3`, MiniMax-H3 pipeline units, frozen video VAE encode, video/audio `FlowMatchScheduler`, PEFT LoRA injection from `DiffusionTrainingModule`, gradient checkpointing/offload, and `OffloadTrainingManager`.
+- **Backward smoke command:** `examples/minimax_h3/model_training/diffusionnft/smoke_train.sh` using rollout index 0, single H100 GPU, batch size 1, rank-4 LoRA, 22 frames at 448x256.
+- **Backward test result:**
+  - latent shape/dtype: `[1, 24, 7, 16, 28]`, `torch.bfloat16`;
+  - sampled timestep id/value: `775` / `391.918427`;
+  - raw video MSE: `0.24644278`;
+  - scheduler training weight: `1.59255123`;
+  - final diffusion loss: `0.39247274`;
+  - trainable LoRA tensors/parameters: `208` / `8,200,192`;
+  - tensors receiving gradients: `208`;
+  - global LoRA gradient norm: `0.00840276`;
+  - final status: `backward_success=true`, `optimizer_step=false`.
+- **Problems encountered:**
+  - an initial smoke used `cpu_offload_split_threshold=1024MB`; the current `OffloadTrainingManager` grouped a parent VAE module, while `UnitWiseParamManager.onload_module()` only onloaded direct (`recurse=False`) parameters, leaving a child convolution weight as an empty placeholder and producing `RuntimeError: weight should have at least three dimensions`;
+  - the new entrypoint was changed to the manager's default leaf-module offload (`split_threshold=None`), which completed VAE encode, DiT forward, and backward without modifying the offload framework;
+  - the environment prints a non-fatal torchao warning because torch 2.6.0+cu124 and torchao 0.16.0 extensions are incompatible; the smoke completed successfully without those extensions.
+- **Current status:** phase 2 complete. A real MiniMax-H3 LoRA diffusion loss produced finite nonzero gradients on every trainable LoRA tensor.
+- **Current limitations:** exactly one rollout video, batch size 1, one process/one CUDA GPU, LoRA only, one sampled timestep, no audio loss, no reward/advantage weighting, no online rollout, no optimizer/scheduler step, and no checkpoint save.
+- **Next step:** phase 3 may wrap this verified forward in group-wise advantage weighting and an explicit optimizer/update loop, while keeping rollout/reward generation separate until the offline weighted-loss path is validated.
+
 ### 2026-08-25 — phase 1 online rollout and MagFace reward
 
 - **Modification goal:** implement current-policy MiniMax-H3 multi-seed rollout, external MagFace reward evaluation, and `rollout.json` persistence without any model update.
