@@ -16,6 +16,7 @@ multi-GPU support, or audio reward/loss.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -94,6 +95,91 @@ def select_prompt_group(
         if not isinstance(reward, (int, float)) or not math.isfinite(float(reward)):
             raise ValueError(f"Group record {group_index} has invalid reward: {reward}")
     return group
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_nft_rollout_artifacts(group: list[dict[str, Any]]) -> None:
+    required_metadata = ("height", "width", "num_frames", "seed")
+    expected_geometry = None
+    for index, record in enumerate(group):
+        for key in ("latent_path", "condition_image_path"):
+            value = record.get(key)
+            if not isinstance(value, str) or not Path(value).is_file():
+                raise FileNotFoundError(
+                    f"Formal nft-step requires an existing {key} for rollout "
+                    f"record {index}; legacy mp4-only rollout is not accepted"
+                )
+        for key in required_metadata:
+            value = record.get(key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"Rollout record {index} has invalid {key}: {value}")
+        geometry = (record["num_frames"], record["height"], record["width"])
+        if expected_geometry is None:
+            expected_geometry = geometry
+        elif geometry != expected_geometry:
+            raise ValueError(
+                f"Same-prompt rollout geometry mismatch: {geometry} != {expected_geometry}"
+            )
+        if record["height"] % 32 or record["width"] % 32:
+            raise ValueError(f"Invalid H3 rollout geometry: {geometry}")
+        if record["num_frames"] < 5 or (record["num_frames"] - 5) % 17:
+            raise ValueError(f"Invalid H3 rollout frame count: {record['num_frames']}")
+
+
+def load_rollout_clean_state(
+    record: dict[str, Any], device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, Image.Image]:
+    latent_path = Path(record["latent_path"]).expanduser().resolve()
+    state = load_file(str(latent_path), device="cpu")
+    required = {"video_latents", "audio_latents"}
+    if set(state) != required:
+        raise ValueError(
+            f"Rollout latent file must contain exactly {sorted(required)}, got {sorted(state)}"
+        )
+    video_x0 = state["video_latents"]
+    audio_x0 = state["audio_latents"]
+    expected_video_shape = (
+        1,
+        24,
+        ((record["num_frames"] - 5) // 17) * 5 + 2,
+        record["height"] // 16,
+        record["width"] // 16,
+    )
+    expected_audio_shape = (
+        2,
+        32,
+        round(record["num_frames"] / 24.0 * 40.0),
+    )
+    if tuple(video_x0.shape) != expected_video_shape:
+        raise ValueError(
+            f"Saved video latent shape {tuple(video_x0.shape)} != {expected_video_shape}"
+        )
+    if tuple(audio_x0.shape) != expected_audio_shape:
+        raise ValueError(
+            f"Saved audio latent shape {tuple(audio_x0.shape)} != {expected_audio_shape}"
+        )
+    condition_path = Path(record["condition_image_path"]).expanduser().resolve()
+    saved_hash = record.get("condition_image_sha256")
+    if saved_hash is not None and _sha256(condition_path) != saved_hash:
+        raise ValueError(f"Condition image hash mismatch: {condition_path}")
+    with Image.open(condition_path) as image:
+        condition_image = image.convert("RGB").copy()
+    if condition_image.size != (record["width"], record["height"]):
+        raise ValueError(
+            f"Condition image size {condition_image.size} does not match rollout geometry"
+        )
+    return (
+        video_x0.to(device=device, dtype=dtype),
+        audio_x0.to(device=device, dtype=dtype),
+        condition_image,
+    )
 
 
 def rollout_scheduler_config(group: list[dict[str, Any]]) -> dict[str, int | float]:
@@ -462,6 +548,38 @@ def prepare_pipeline_inputs(model, frames: list[Image.Image], prompt: str):
     return inputs
 
 
+def prepare_nft_pipeline_inputs(
+    model,
+    record: dict[str, Any],
+    condition_image: Image.Image,
+):
+    # Reuse the existing training-module input contract for dimensions, then
+    # explicitly remove input_video so no generated mp4 is decoded or VAE
+    # encoded. The saved PNG is used for both FL2AV prompt presentation and the
+    # keyframe VAE anchor, exactly as it was during rollout.
+    placeholder_frames = [condition_image] * record["num_frames"]
+    inputs_shared, inputs_posi, inputs_nega = model.get_pipeline_inputs(
+        {"video": placeholder_frames, "prompt": record["prompt"]}
+    )
+    inputs_shared["input_video"] = None
+    inputs_shared["keyframes"] = [condition_image]
+    inputs_shared["keyframe_indices"] = [0]
+    inputs_shared["seed"] = record["seed"]
+    inputs = model.transfer_data_to_device(
+        (inputs_shared, inputs_posi, inputs_nega),
+        model.pipe.device,
+        model.pipe.torch_dtype,
+    )
+    for unit in model.pipe.units:
+        inputs = model.pipe.unit_runner(unit, model.pipe, *inputs)
+    inputs_shared, inputs_posi, inputs_nega = inputs
+    if "input_latents" in inputs_shared:
+        raise RuntimeError("Formal nft-step unexpectedly VAE-encoded an input video")
+    if inputs_shared.get("keyframe_cond_anchor") is None:
+        raise RuntimeError("Formal nft-step did not construct the FL2AV keyframe condition")
+    return inputs_shared, inputs_posi, inputs_nega
+
+
 def make_forward_diffusion(
     model,
     inputs_shared: dict[str, Any],
@@ -496,6 +614,48 @@ def make_forward_diffusion(
     return input_latents, x_t, velocity_target, timestep_video, timestep_audio, sigma
 
 
+def make_joint_forward_diffusion(
+    model,
+    video_x0: torch.Tensor,
+    audio_x0: torch.Tensor,
+    timestep_id: int,
+    noise_seed: int,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    timestep_video = model.pipe.scheduler.timesteps[timestep_id].to(
+        dtype=torch.float32, device=device
+    )
+    timestep_audio = model.pipe.scheduler_audio.timesteps[timestep_id].to(
+        dtype=torch.float32, device=device
+    )
+    video_generator = torch.Generator(device=device).manual_seed(noise_seed)
+    audio_generator = torch.Generator(device=device).manual_seed(noise_seed + 10_000_019)
+    video_noise = torch.randn(
+        video_x0.shape,
+        generator=video_generator,
+        device=device,
+        dtype=video_x0.dtype,
+    )
+    audio_noise = torch.randn(
+        audio_x0.shape,
+        generator=audio_generator,
+        device=device,
+        dtype=audio_x0.dtype,
+    )
+    video_xt = model.pipe.scheduler.add_noise(video_x0, video_noise, timestep_video)
+    audio_xt = model.pipe.scheduler_audio.add_noise(audio_x0, audio_noise, timestep_audio)
+    sigma_video = scheduler_sigma(model.pipe.scheduler, timestep_video, device)
+    sigma_audio = scheduler_sigma(model.pipe.scheduler_audio, timestep_audio, device)
+    return video_xt, audio_xt, timestep_video, timestep_audio, sigma_video, sigma_audio
+
+
 def model_velocity(
     model,
     inputs_shared: dict[str, Any],
@@ -504,10 +664,13 @@ def model_velocity(
     timestep_video: torch.Tensor,
     timestep_audio: torch.Tensor,
     *,
+    audio_x_t: torch.Tensor | None = None,
     checkpoint: bool,
 ) -> torch.Tensor:
     forward_inputs = dict(inputs_shared)
     forward_inputs["video_latents"] = x_t
+    if audio_x_t is not None:
+        forward_inputs["audio_latents"] = audio_x_t
     forward_inputs["use_gradient_checkpointing"] = checkpoint
     forward_inputs["use_gradient_checkpointing_offload"] = checkpoint and bool(
         inputs_shared.get("use_gradient_checkpointing_offload", False)
@@ -641,17 +804,22 @@ def run_nft_step(
         flush=True,
     )
 
-    expected_shape = None
     for sample_index, (record, ratio) in enumerate(zip(group, ratios, strict=True)):
-        frames, fps = decode_video_frames(record["video_path"])
-        shape = (len(frames), frames[0].size[1], frames[0].size[0])
-        if expected_shape is None:
-            expected_shape = shape
-        elif shape != expected_shape:
-            raise ValueError(f"All rollout videos in a group must share shape: {shape} != {expected_shape}")
-        inputs_shared, inputs_posi, _ = prepare_pipeline_inputs(model, frames, record["prompt"])
-        # Frozen VAE/text forwards do not participate in backward. Reset the
-        # existing hook manager before the three policy forwards.
+        video_x0, audio_x0, condition_image = load_rollout_clean_state(
+            record, device, model.pipe.torch_dtype
+        )
+        inputs_shared, inputs_posi, _ = prepare_nft_pipeline_inputs(
+            model, record, condition_image
+        )
+        print(
+            f"[rollout-state {sample_index}] video_latent_shape={list(video_x0.shape)} "
+            f"audio_latent_shape={list(audio_x0.shape)} "
+            f"condition_image_path={Path(record['condition_image_path']).resolve()} "
+            "uses_rollout_clean_latent=true uses_exact_rollout_condition=true",
+            flush=True,
+        )
+        # Frozen condition/text forwards do not participate in backward. Reset
+        # the existing hook manager before the three joint policy forwards.
         offload_manager.after_backward()
         timestep_indices = selected_timestep_indices(
             num_inference_steps,
@@ -672,9 +840,17 @@ def run_nft_step(
                 + sample_index * num_inference_steps
                 + timestep_id
             )
-            x0, x_t, _, timestep_video, timestep_audio, sigma = make_forward_diffusion(
+            (
+                video_xt,
+                audio_xt,
+                timestep_video,
+                timestep_audio,
+                sigma_video,
+                sigma_audio,
+            ) = make_joint_forward_diffusion(
                 model,
-                inputs_shared,
+                video_x0,
+                audio_x0,
                 timestep_id,
                 noise_seed,
                 device,
@@ -686,9 +862,10 @@ def run_nft_step(
                     model,
                     inputs_shared,
                     inputs_posi,
-                    x_t,
+                    video_xt,
                     timestep_video,
                     timestep_audio,
+                    audio_x_t=audio_xt,
                     checkpoint=False,
                 ).detach()
             offload_manager.after_backward()
@@ -699,9 +876,10 @@ def run_nft_step(
                     model,
                     inputs_shared,
                     inputs_posi,
-                    x_t,
+                    video_xt,
                     timestep_video,
                     timestep_audio,
+                    audio_x_t=audio_xt,
                     checkpoint=False,
                 ).detach()
             offload_manager.after_backward()
@@ -711,9 +889,10 @@ def run_nft_step(
                 model,
                 inputs_shared,
                 inputs_posi,
-                x_t,
+                video_xt,
                 timestep_video,
                 timestep_audio,
+                audio_x_t=audio_xt,
                 checkpoint=True,
             )
 
@@ -725,28 +904,28 @@ def run_nft_step(
                 (1.0 + args.policy_beta) * old_prediction
                 - args.policy_beta * current_prediction
             )
-            sigma_expanded = sigma.view(*([1] * x0.ndim))
-            positive_x0 = x_t - sigma_expanded * positive_prediction
-            negative_x0 = x_t - sigma_expanded * implicit_negative_prediction
-            reduce_dims = tuple(range(1, x0.ndim))
+            sigma_expanded = sigma_video.view(*([1] * video_x0.ndim))
+            positive_x0 = video_xt - sigma_expanded * positive_prediction
+            negative_x0 = video_xt - sigma_expanded * implicit_negative_prediction
+            reduce_dims = tuple(range(1, video_x0.ndim))
             with torch.no_grad():
                 positive_weight = (
-                    (positive_x0.double() - x0.double())
+                    (positive_x0.double() - video_x0.double())
                     .abs()
                     .mean(dim=reduce_dims, keepdim=True)
                     .clamp(min=1e-5)
                 )
                 negative_weight = (
-                    (negative_x0.double() - x0.double())
+                    (negative_x0.double() - video_x0.double())
                     .abs()
                     .mean(dim=reduce_dims, keepdim=True)
                     .clamp(min=1e-5)
                 )
             positive_loss = (
-                (positive_x0 - x0).square() / positive_weight
+                (positive_x0 - video_x0).square() / positive_weight
             ).mean(dim=reduce_dims)
             negative_loss = (
-                (negative_x0 - x0).square() / negative_weight
+                (negative_x0 - video_x0).square() / negative_weight
             ).mean(dim=reduce_dims)
             original_policy_loss = (
                 ratio.to(device) * positive_loss / args.policy_beta
@@ -772,7 +951,9 @@ def run_nft_step(
                 f"seed={record.get('seed')} reward={float(record['reward']):.8f} "
                 f"advantage={float(advantages[sample_index]):.8f} r={float(ratio):.8f} "
                 f"timestep_id={timestep_id} timestep={float(timestep_video):.8f} "
-                f"sigma={float(sigma):.8f} positive_loss={positive_loss.mean().item():.8f} "
+                f"video_sigma={float(sigma_video):.8f} "
+                f"audio_sigma={float(sigma_audio):.8f} "
+                f"positive_loss={positive_loss.mean().item():.8f} "
                 f"negative_loss={negative_loss.mean().item():.8f} "
                 f"policy_loss={policy_loss.item():.8f} kl_loss={kl_loss.item():.8f} "
                 f"current_reference_prediction_distance={current_reference_distance:.8f} "
@@ -941,6 +1122,7 @@ def main() -> None:
     resume_state = None
     global_step = 0
     if args.mode == "nft-step":
+        validate_nft_rollout_artifacts(selected)
         scheduler_config = rollout_scheduler_config(selected)
         # Validate the official leading-fraction selection before loading H3.
         selected_timestep_indices(

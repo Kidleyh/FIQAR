@@ -14,6 +14,8 @@ py312/bin/python examples/minimax_h3/model_training/diffusionnft/train.py \
   --device cuda:0 \
   --lora-rank 4 \
   --lora-target-modules qkv_proj,out_proj \
+  --timestep-fraction 0.99 \
+  --shuffle-timesteps \
   --adv-clip-max 5 \
   --policy-beta 1.0 \
   --kl-beta 1e-4 \

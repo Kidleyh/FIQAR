@@ -6,7 +6,7 @@ cd /gemini/platform/public/aigc/human_guozz2/code/lyh/job/DiffSynth-Studio-minim
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-ROLLOUT_JSON="${ROLLOUT_JSON:-outputs/minimax_h3_diffusionnft_rollout_phase4/rollout.json}"
+ROLLOUT_JSON="${ROLLOUT_JSON:-outputs/minimax_h3_diffusionnft_rollout_phase45/rollout.json}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RUN_DIR:-outputs/minimax_h3_diffusionnft_phase4_2step/${RUN_ID}}"
 CHECKPOINT_1="${RUN_DIR}/checkpoint-1"

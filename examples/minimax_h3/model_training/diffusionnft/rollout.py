@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image
+from safetensors.torch import save_file
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -52,6 +55,27 @@ def _write_json(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _write_latents(path: Path, latents: dict[str, torch.Tensor]) -> None:
+    required = {"video_latents", "audio_latents"}
+    if set(latents) != required:
+        raise ValueError(f"Unexpected rollout latent keys: {sorted(latents)}")
+    state = {
+        key: value.detach().to("cpu").contiguous()
+        for key, value in latents.items()
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    save_file(state, str(temporary))
+    temporary.replace(path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_seeds(num_samples: int | None, seeds: list[int] | None) -> list[int]:
@@ -169,14 +193,31 @@ def main() -> None:
         folder_name = safe_folder_name(source_video, used_names)
         prompt_dir = args.output_dir / f"prompt_{record_index:06d}_{folder_name}"
         prompt_dir.mkdir(parents=True, exist_ok=True)
+        condition_path = (prompt_dir / "condition_image.png").resolve()
+        first_frame.save(condition_path, format="PNG")
+        with Image.open(condition_path) as saved_condition:
+            condition_image = saved_condition.convert("RGB").copy()
+        condition_sha256 = _sha256(condition_path)
+        if condition_image.size != (render_width, render_height):
+            raise RuntimeError(
+                f"Saved condition size {condition_image.size} does not match "
+                f"rollout size {(render_width, render_height)}"
+            )
 
         for seed in seeds:
             video_path = (prompt_dir / f"seed_{seed}.mp4").resolve()
-            if args.skip_existing and video_path.is_file() and video_path.stat().st_size > 0:
+            latent_path = (prompt_dir / f"seed_{seed}_latents.safetensors").resolve()
+            if (
+                args.skip_existing
+                and video_path.is_file()
+                and video_path.stat().st_size > 0
+                and latent_path.is_file()
+                and latent_path.stat().st_size > 0
+            ):
                 print(f"[rollout] reuse seed={seed} video={video_path}", flush=True)
             else:
                 print(f"[rollout] generate record={record_index} seed={seed}", flush=True)
-                video, audio = pipe(
+                video, audio, clean_latents = pipe(
                     prompt=prompt,
                     negative_prompt=args.negative_prompt,
                     height=render_height,
@@ -188,8 +229,9 @@ def main() -> None:
                     flow_shift=args.flow_shift,
                     audio_flow_shift=args.audio_flow_shift,
                     tiled=not args.no_tiled,
-                    keyframes=[first_frame],
+                    keyframes=[condition_image],
                     keyframe_indices=[0],
+                    return_latents=True,
                 )
                 if len(video) != frame_count:
                     raise RuntimeError(
@@ -203,11 +245,19 @@ def main() -> None:
                     audio_sample_rate=pipe.audio_vae.sample_rate,
                     video_quality=8,
                 )
+                _write_latents(latent_path, clean_latents)
             generated.append(
                 {
                     "prompt": prompt,
                     "seed": seed,
                     "video_path": str(video_path),
+                    "latent_path": str(latent_path),
+                    "condition_image_path": str(condition_path),
+                    "condition_image_sha256": condition_sha256,
+                    "height": render_height,
+                    "width": render_width,
+                    "num_frames": frame_count,
+                    "fps": H3_FPS,
                     "num_inference_steps": args.num_inference_steps,
                     "flow_shift": args.flow_shift,
                     "audio_flow_shift": args.audio_flow_shift,

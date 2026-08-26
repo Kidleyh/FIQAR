@@ -103,6 +103,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         retake_audio: torch.Tensor = None,
         retake_audio_sample_rate: int = 32000,
         seconds_regions_to_retake: list[tuple[float, float]] = None,
+        return_latents: bool = False,
         progress_bar_cmd=tqdm,
     ):
         """Generate a joint video + audio sample.
@@ -113,6 +114,10 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         `keyframes` (FL2AV) is a list of PIL images with `keyframe_indices` in
         {0, -1}; both are resized onto the target canvas.
+
+        If `return_latents=True`, a third return value contains detached CPU
+        copies of the final clean video/audio latents captured before VAE
+        decode. The default two-value return contract is unchanged.
 
         `references` (Ref2AV) is a list of dicts in request order:
 
@@ -166,7 +171,15 @@ class MiniMaxH3Pipeline(BasePipeline):
                 inpaint_mask=inputs_shared.get("denoise_mask_audio"), input_latents=inputs_shared.get("input_latents_audio"),
             )
 
-        # 5. Decode
+        # 5. Preserve optional clean rollout state before VAE decode.
+        clean_latents = None
+        if return_latents:
+            clean_latents = {
+                "video_latents": inputs_shared["video_latents"].detach().to("cpu").contiguous(),
+                "audio_latents": inputs_shared["audio_latents"].detach().to("cpu").contiguous(),
+            }
+
+        # 6. Decode
         self.load_models_to_device(["video_vae"])
         frames = self.video_vae.decode_video(inputs_shared["video_latents"], dtype=self.torch_dtype, tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap)
         video = self.vae_output_to_video(frames, min_value=0, max_value=1)
@@ -174,6 +187,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.load_models_to_device(["audio_vae"])
         waveform = self.audio_vae.decode_audio(inputs_shared["audio_latents"], dtype=self.torch_dtype)
         audio = self.output_audio_format_check(waveform)
+        if return_latents:
+            return video, audio, clean_latents
         return video, audio
 
 

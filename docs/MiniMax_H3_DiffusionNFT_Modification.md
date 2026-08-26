@@ -10,6 +10,30 @@
 
 ## Change history
 
+### 2026-08-26 — phase 4.5 rollout/training state and conditioning consistency
+
+- **Modification goal:** make formal NFT training consume the exact clean joint latent state and exact FL2AV first-frame condition used by rollout, while retaining mp4 only for MagFace reward and retaining the Phase-2 mp4/VAE backward smoke as a legacy diagnostic.
+- **Modified files:**
+  - `diffsynth/pipelines/minimax_h3_audio_video.py`;
+  - `examples/minimax_h3/model_training/diffusionnft/rollout.py`;
+  - `examples/minimax_h3/model_training/diffusionnft/train.py`;
+  - `examples/minimax_h3/model_training/diffusionnft/smoke_nft_step.sh`;
+  - `examples/minimax_h3/model_training/diffusionnft/smoke_nft_2step.sh`.
+- **New file:** `examples/minimax_h3/model_training/diffusionnft/smoke_nft_state_consistency.sh`.
+- **Minimal pipeline extension:** `MiniMaxH3Pipeline.__call__` now accepts backward-compatible `return_latents=False`. When enabled, it returns a third dictionary containing detached CPU copies of final `video_latents` and `audio_latents`, captured after denoising and before either VAE decode. The default two-value return and all default generation behavior are unchanged; DiT, VAE, scheduler, and common training code are unchanged.
+- **Rollout state persistence:** each seed writes `seed_<seed>_latents.safetensors` with exactly `video_latents` and `audio_latents`, and records its absolute `latent_path`. `--skip-existing` now reuses a sample only when both mp4 and latent file exist. The resized rollout first frame is saved losslessly as `condition_image.png`, reloaded, and that exact reloaded image is passed to rollout as `keyframes=[condition_image]`, `keyframe_indices=[0]`. Each record stores `condition_image_path`, its SHA-256, width, height, frame count, fps, and scheduler metadata.
+- **Formal NFT input contract:** `--mode nft-step` requires every selected record to contain an existing `latent_path` and `condition_image_path`, matching geometry, and valid seed/scheduler metadata. Missing state raises immediately; it never falls back to decoding or VAE-encoding the mp4. `--mode backward-smoke` retains the legacy mp4 decode -> VAE encode path.
+- **Exact FL2AV conditioning:** formal NFT loads the saved RGB PNG, verifies its optional SHA-256 and dimensions, and runs the existing H3 condition units with `keyframes=[condition_image]`, `keyframe_indices=[0]`, and the rollout seed. A frame list is supplied only for the existing geometry contract; `input_video=None` is set before pipeline units run, and training rejects any resulting clean `input_latents`, preventing accidental mp4/VAE reuse.
+- **Joint forward state:** for each selected schedule index, training samples deterministic video/audio noise and uses each existing scheduler independently:
+  - `video_xt = scheduler.add_noise(video_x0, video_noise, video_t)` = `(1-sigma_video) * video_x0 + sigma_video * video_noise`;
+  - `audio_xt = scheduler_audio.add_noise(audio_x0, audio_noise, audio_t)` = `(1-sigma_audio) * audio_x0 + sigma_audio * audio_noise`.
+  Both noisy states enter every current/old/reference joint H3 DiT forward. NFT reconstruction, policy loss, reward, and KL remain video-prediction-only; no audio reward or audio policy loss was added.
+- **Real rollout smoke:** prompt 0, seeds 0/1, 448x256, 22 frames, 3 inference steps, video shift 12 and audio shift 3. Each safetensors file reloaded successfully with video shape `[1, 24, 7, 16, 28]` and audio shape `[2, 32, 37]`; the shared condition PNG is 448x256 and its SHA-256 matches both rollout records. MagFace rewards were `21.79515616` and `22.16554221`, with face-visible ratio `1.0` and 8 detected faces for each sample.
+- **Real consistency optimizer smoke:** `bash examples/minimax_h3/model_training/diffusionnft/smoke_nft_state_consistency.sh` completed 2 samples x 2 selected timesteps = 4 normalized backward passes and one optimizer step. Both samples printed `uses_rollout_clean_latent=true` and `uses_exact_rollout_condition=true`. The non-endpoint schedule index printed `video_sigma=0.95999998` and `audio_sigma=0.85714281`, proving separate scheduler shifts/noise states were used; the endpoint printed 1.0/1.0.
+- **Optimizer result:** group positive/negative loss `0.60300767 / 0.60300767`, policy loss and total loss `3.01503801`, KL `0` on the initial current=reference step, gradient norm `0.10306433`, current parameter delta `0.235702204011`, frozen old/reference policies had no gradients, and final `optimizer_step=true`, `global_step 0 -> 1`.
+- **Current status:** phase 4.5 complete. Formal NFT training now uses rollout-native clean video/audio latent state and exact rollout FL2AV conditioning, with a real joint-forward LoRA optimizer step verified.
+- **Current limitations / next step:** latent artifacts are per-sample and not yet managed by retention/cleanup policy; only video prediction participates in reward and NFT policy loss. The next phase may build a bounded online generate -> reward -> train orchestration loop around this now-consistent state contract. Multi-GPU and audio reward/loss remain deferred.
+
 ### 2026-08-26 — phase 4 repeated multi-timestep DiffusionNFT updates
 
 - **Modification goal:** replace the Phase-3 random 1000-step single-timestep NFT path with rollout-schedule multi-timestep training, then persist and resume current/old LoRA, optimizer, and `global_step` across real updates. Online rollout-training iteration remains out of scope.
