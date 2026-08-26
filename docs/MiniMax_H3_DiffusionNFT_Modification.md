@@ -10,6 +10,45 @@
 
 ## Change history
 
+### 2026-08-26 — phase 3 one-step LoRA DiffusionNFT update
+
+- **Modification goal:** consume an existing same-prompt rollout group and complete one real `reward -> group advantage -> positive/implicit-negative DiffusionNFT objective -> reference regularization -> backward -> optimizer.step()` update on MiniMax-H3 LoRA.
+- **Official reference:** `/gemini/platform/public/aigc/human_guozz2/code/lyh/job/DiffusionNFT/scripts/train_nft_sd3.py`. The reward normalization, clipping/mixing ratio, positive/implicit-negative construction, adaptive reconstruction weighting, policy-loss scaling, reference MSE, gradient clipping, and old-policy decay follow that implementation. H3 scheduler algebra replaces the SD3-specific normalized-time expression.
+- **Modified file:** `examples/minimax_h3/model_training/diffusionnft/train.py`.
+  - retained Phase 2 as the default `--mode backward-smoke` path;
+  - added `--mode nft-step`, same-prompt group selection, population-standard-deviation advantage normalization, serial batch-size-1 accumulation, current/old/reference policy switching, official NFT losses, AdamW, gradient clipping, one optimizer step, and configurable old-policy decay;
+  - current policy is the trainable `default` LoRA; `old` is a second frozen PEFT adapter copied from current before the step; reference is the same frozen MiniMax-H3 DiT with all adapters disabled;
+  - old and reference forwards run under `no_grad`; only the current adapter is passed to the optimizer;
+  - added validations for finite rewards, at least two same-prompt videos, compatible video shapes, all current LoRA tensors receiving gradients, frozen-policy gradient isolation, finite nonzero gradient norm, and nonzero parameter delta.
+- **New file:** `examples/minimax_h3/model_training/diffusionnft/smoke_nft_step.sh`, fixed to the existing two-seed smoke rollout, rank-4 `qkv_proj,out_proj` LoRA, one H100, and one optimizer step.
+- **H3 FlowMatch formula mapping:** for the scheduler's actual sigma at the selected training timestep,
+  - `x_t = scheduler.add_noise(x0, noise, t) = (1-sigma) * x0 + sigma * noise`;
+  - `v_target = scheduler.training_target(x0, noise, t) = noise - x0`;
+  - therefore `x_t = x0 + sigma * v_target` and the reconstruction used by NFT is `x0_prediction = x_t - sigma * v_prediction`;
+  - sigma is looked up from `scheduler.sigmas` using the selected `scheduler.timesteps` entry. No SD3 `t/1000` assumption is used.
+- **DiffusionNFT objective mapping:**
+  - `advantage = (reward - group_mean) / (population_std + eps)`;
+  - `adv_clip = clamp(advantage, -adv_clip_max, adv_clip_max)` and `r = clamp((adv_clip / adv_clip_max) / 2 + 0.5, 0, 1)`;
+  - `positive_pred = policy_beta * current_pred + (1-policy_beta) * old_pred`;
+  - `implicit_negative_pred = (1+policy_beta) * old_pred - policy_beta * current_pred`;
+  - each reconstructed-x0 squared error is divided by its detached mean absolute reconstruction error, matching the official adaptive weighting;
+  - `policy_loss = adv_clip_max * mean(r * positive_loss / policy_beta + (1-r) * negative_loss / policy_beta)`;
+  - `kl_loss = MSE(current_pred, reference_pred)` and `total_loss = policy_loss + kl_beta * kl_loss`.
+- **Old-policy update:** after the optimizer step, `old = decay * old + (1-decay) * current`. `--old-decay-type {0,1,2}` and `--old-decay-step` reproduce the official `return_decay` schedules; smoke defaults to type 1 at step 1, giving decay `0.001`.
+- **Real smoke command:** `bash examples/minimax_h3/model_training/diffusionnft/smoke_nft_step.sh`.
+- **Real smoke result:**
+  - rewards: `[22.35523033, 22.73575974]`;
+  - advantages: `[-0.99946970, 0.99947971]`; `r`: `[0.40005302, 0.59994799]`;
+  - sample sigmas: `0.39191842` at timestep id 775 and `0.96082568` at timestep id 83;
+  - group positive loss `1.10106587`, negative loss `1.10106587`, policy loss `5.50532961`, KL loss `0.00000000`, total loss `5.50532961`;
+  - all `208` current LoRA tensors received gradients; pre-clip gradient norm `0.15455209`; clip return norm `0.15429688` with max norm `1.0`;
+  - current LoRA parameter delta after AdamW step: `0.235854022010`;
+  - `old_policy_no_grad=true`, `reference_policy_no_grad=true`, `optimizer_step=true`.
+- **Interpretation/current limitation:** on the first step, old is an exact copy of current and PEFT LoRA B matrices start at zero, so positive and implicit-negative predictions have equal forward values and the reference KL is zero. Their derivatives with respect to current differ, and reward-derived `r` still controls the policy gradient. Later steps will separate current, old, and reference predictions. This phase intentionally executes exactly one offline group step and does not add online rollout-training iteration, multi-GPU, checkpoint/resume, audio loss, or repeated optimizer steps.
+- **Problem encountered:** the first shell launch stopped before model loading because `set -u` conflicts with an unset variable in Conda's CUDA activation hook. The smoke script now directly invokes the repository's verified `py312/bin/python`, matching Phase 2. No H3 core or common framework file was changed.
+- **Current status:** phase 3 complete; a real two-seed MiniMax-H3 LoRA DiffusionNFT optimizer step passed every requested gradient, isolation, and parameter-update check.
+- **Next step:** build a bounded online rollout/reward/train loop around this verified single-group step, then add LoRA checkpoint/resume and repeated-step old-policy scheduling without changing the H3 model or scheduler internals.
+
 ### 2026-08-26 — phase 2 minimal LoRA training forward/backward
 
 - **Modification goal:** verify one generated MiniMax-H3 video can traverse VAE encode -> forward diffusion -> H3 DiT prediction -> diffusion MSE -> `backward()` without reward weighting or a model update.
