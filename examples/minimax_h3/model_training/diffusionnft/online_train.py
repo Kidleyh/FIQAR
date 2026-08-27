@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,10 +57,56 @@ def read_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def require_nonempty_file(path: Path, label: str) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise FileNotFoundError(f"Missing or empty {label}: {path}")
+
+
+def resource_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    statm = Path("/proc/self/statm")
+    if statm.is_file():
+        resident_pages = int(statm.read_text(encoding="utf-8").split()[1])
+        snapshot["orchestrator_cpu_rss_mb"] = (
+            resident_pages * os.sysconf("SC_PAGE_SIZE") / 1024**2
+        )
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        snapshot["gpu_memory_mb"] = [
+            {
+                "index": int(parts[0]),
+                "used": float(parts[1]),
+                "total": float(parts[2]),
+            }
+            for line in result.stdout.splitlines()
+            if line.strip()
+            for parts in ([item.strip() for item in line.split(",")],)
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        snapshot["gpu_memory_error"] = str(error)
+    return snapshot
+
+
 def checkpoint_state(path: Path, expected_step: int | None = None) -> dict[str, Any]:
     if not path.is_dir():
         raise FileNotFoundError(path)
-    missing = [name for name in CHECKPOINT_FILES if not (path / name).is_file()]
+    missing = [
+        name
+        for name in CHECKPOINT_FILES
+        if not (path / name).is_file() or (path / name).stat().st_size <= 0
+    ]
     if missing:
         raise RuntimeError(f"Incomplete checkpoint {path}: missing={missing}")
     state = read_json(path / "training_state.json")
@@ -102,7 +151,10 @@ def validate_rollout(
     rollout_json: Path,
     expected: dict[str, Any],
     seeds: list[int],
+    dataset_position: int,
+    rollout_dir: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    require_nonempty_file(rollout_json, "rollout.json")
     payload = read_json(rollout_json)
     records = payload.get("rollouts") if isinstance(payload, dict) else payload
     if not isinstance(records, list) or len(records) != len(seeds):
@@ -121,11 +173,42 @@ def validate_rollout(
     visible_ratios: list[float] = []
     face_counts: list[int] = []
     missing_face_samples = 0
+    rollout_dir = rollout_dir.resolve()
+    prompt_directories: set[Path] = set()
+    condition_paths: set[Path] = set()
+    video_paths: set[Path] = set()
+    latent_paths: set[Path] = set()
     for index, record in enumerate(records):
         for key in ("video_path", "latent_path", "condition_image_path"):
             value = record.get(key)
-            if not isinstance(value, str) or not Path(value).is_file():
+            if not isinstance(value, str):
                 raise FileNotFoundError(f"Rollout record {index} missing {key}: {value}")
+            require_nonempty_file(Path(value), f"rollout record {index} {key}")
+        video_path = Path(record["video_path"]).resolve()
+        latent_path = Path(record["latent_path"]).resolve()
+        condition_path = Path(record["condition_image_path"]).resolve()
+        prompt_dir = video_path.parent
+        if prompt_dir.parent != rollout_dir:
+            raise ValueError(
+                f"Rollout record {index} is outside current rollout directory: {video_path}"
+            )
+        if not prompt_dir.name.startswith(f"prompt_{dataset_position:06d}_"):
+            raise ValueError(
+                f"Rollout record {index} belongs to the wrong dataset position: "
+                f"{prompt_dir.name} != prompt_{dataset_position:06d}_*"
+            )
+        if latent_path.parent != prompt_dir or condition_path.parent != prompt_dir:
+            raise ValueError(
+                f"Rollout record {index} mixes prompt artifact directories"
+            )
+        if video_path.name != f"seed_{record.get('seed')}.mp4" or latent_path.name != (
+            f"seed_{record.get('seed')}_latents.safetensors"
+        ):
+            raise ValueError(f"Rollout record {index} seed/artifact names do not match")
+        prompt_directories.add(prompt_dir)
+        condition_paths.add(condition_path)
+        video_paths.add(video_path)
+        latent_paths.add(latent_path)
         actual = {key: record.get(key) for key in expected}
         if actual != expected:
             raise ValueError(
@@ -163,8 +246,17 @@ def validate_rollout(
         face_counts.append(face_count)
         if mean_quality is None or face_count == 0:
             missing_face_samples += 1
+    if len(prompt_directories) != 1 or len(condition_paths) != 1:
+        raise ValueError("Online group must use exactly one prompt directory/condition")
+    if len(video_paths) != len(records) or len(latent_paths) != len(records):
+        raise ValueError("Online group contains duplicate video or latent artifacts")
     valid_qualities = [value for value in mean_qualities if value is not None]
     stats = {
+        "dataset_position": dataset_position,
+        "prompt": records[0]["prompt"],
+        "prompt_sha256": hashlib.sha256(
+            records[0]["prompt"].encode("utf-8")
+        ).hexdigest(),
         "rewards": rewards,
         "reward_mean": statistics.fmean(rewards),
         "reward_std": statistics.pstdev(rewards),
@@ -184,10 +276,12 @@ def validate_rollout(
     return records, stats
 
 
-def run_streaming(command: list[str], log_path: Path) -> str:
+def run_streaming(command: list[str], log_path: Path) -> tuple[str, dict[str, Any]]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[command] {' '.join(command)}", flush=True)
     captured: list[str] = []
+    before = resource_snapshot()
+    started = time.monotonic()
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -204,9 +298,37 @@ def run_streaming(command: list[str], log_path: Path) -> str:
             log.flush()
             captured.append(line)
         return_code = process.wait()
+    telemetry = {
+        "subprocess_exit_code": return_code,
+        "wall_time_seconds": time.monotonic() - started,
+        "resource_before": before,
+        "resource_after": resource_snapshot(),
+        "subprocess_executed": True,
+    }
     if return_code != 0:
         raise subprocess.CalledProcessError(return_code, command)
-    return "".join(captured)
+    return "".join(captured), telemetry
+
+
+def reused_stage_telemetry() -> dict[str, Any]:
+    snapshot = resource_snapshot()
+    return {
+        "subprocess_exit_code": 0,
+        "wall_time_seconds": 0.0,
+        "resource_before": snapshot,
+        "resource_after": snapshot,
+        "subprocess_executed": False,
+    }
+
+
+def reward_wall_time_from_log(log_path: Path) -> float | None:
+    if not log_path.is_file():
+        return None
+    matches = re.findall(
+        r'"elapsed_seconds"\s*:\s*([0-9eE+.-]+)',
+        log_path.read_text(encoding="utf-8"),
+    )
+    return float(matches[-1]) if matches else None
 
 
 def parse_train_metrics(output: str) -> dict[str, Any]:
@@ -273,6 +395,7 @@ def iteration_metrics(
     policy: dict[str, Any],
     rollout_metrics: dict[str, Any],
     train_metrics: dict[str, Any],
+    stage_metrics: dict[str, Any],
     checkpoint: Path,
 ) -> dict[str, Any]:
     return {
@@ -286,6 +409,7 @@ def iteration_metrics(
         **policy,
         **rollout_metrics,
         **train_metrics,
+        **stage_metrics,
         "checkpoint": str(checkpoint),
         "iteration_success": True,
     }
@@ -317,6 +441,10 @@ def write_observability_outputs(run_dir: Path, state: dict[str, Any]) -> None:
     missing_counts = [int(row["missing_face_samples"]) for row in rows]
     sample_count = sum(len(row["rewards"]) for row in rows)
     checkpoints = [row["checkpoint"] for row in rows]
+    iteration_wall_times = [float(row.get("iteration_wall_time_seconds", 0)) for row in rows]
+    rollout_wall_times = [float(row.get("rollout_wall_time_seconds", 0)) for row in rows]
+    training_wall_times = [float(row.get("training_wall_time_seconds", 0)) for row in rows]
+    reward_wall_times = [row.get("reward_wall_time_seconds") for row in rows]
     summary = {
         "iteration_count": len(rows),
         "group_size": state.get("config", {}).get("num_samples_per_prompt"),
@@ -349,8 +477,112 @@ def write_observability_outputs(run_dir: Path, state: dict[str, Any]) -> None:
         "missing_face_samples": sum(missing_counts),
         "missing_face_ratio": sum(missing_counts) / sample_count if sample_count else None,
         "checkpoints": checkpoints,
+        "iteration_wall_time_seconds_by_iteration": iteration_wall_times,
+        "rollout_wall_time_seconds_by_iteration": rollout_wall_times,
+        "reward_wall_time_seconds_by_iteration": reward_wall_times,
+        "training_wall_time_seconds_by_iteration": training_wall_times,
+        "rollout_subprocess_exit_codes": [
+            row.get("rollout_subprocess_exit_code") for row in rows
+        ],
+        "training_subprocess_exit_codes": [
+            row.get("training_subprocess_exit_code") for row in rows
+        ],
     }
     write_json_atomic(run_dir / "training_summary.json", summary)
+
+
+def apply_checkpoint_retention(
+    run_dir: Path,
+    state: dict[str, Any],
+    keep_last: int,
+) -> list[int]:
+    if keep_last <= 0:
+        return []
+    checkpoints_root = run_dir / "checkpoints"
+    available: list[tuple[int, Path]] = []
+    for path in checkpoints_root.glob("checkpoint-*"):
+        match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+        if match and path.is_dir():
+            available.append((int(match.group(1)), path.resolve()))
+    available.sort()
+    retained = {path for _, path in available[-keep_last:]}
+    latest = Path(state["latest_checkpoint"]).resolve()
+    retained.add(latest)
+    removed_steps: list[int] = []
+    for step, path in available:
+        if path in retained:
+            continue
+        checkpoint_state(path, step)
+        # Record the retention decision atomically before removal. A crash here
+        # leaves only an unreferenced, still-valid checkpoint directory.
+        for item in state.get("iterations", []):
+            if item.get("checkpoint") == str(path):
+                item["checkpoint_retained"] = False
+            metrics = item.get("metrics")
+            if isinstance(metrics, dict) and metrics.get("checkpoint") == str(path):
+                metrics["checkpoint_retained"] = False
+        state.setdefault("retention", {}).setdefault("removed_checkpoint_steps", [])
+        if step not in state["retention"]["removed_checkpoint_steps"]:
+            state["retention"]["removed_checkpoint_steps"].append(step)
+        write_json_atomic(run_dir / "online_state.json", state)
+        shutil.rmtree(path)
+        removed_steps.append(step)
+    state.setdefault("retention", {})["keep_last_checkpoints"] = keep_last
+    state["retention"]["retained_checkpoints"] = [
+        str(path) for _, path in available if path.exists()
+    ]
+    write_json_atomic(run_dir / "online_state.json", state)
+    return removed_steps
+
+
+def export_final(run_dir: Path, state: dict[str, Any]) -> Path:
+    latest_value = state.get("latest_checkpoint")
+    if not isinstance(latest_value, str):
+        raise ValueError("Cannot export final LoRA without a latest checkpoint")
+    latest = Path(latest_value).resolve()
+    checkpoint_state(latest, int(state["global_step"]))
+    final_dir = run_dir / "final"
+    final_files = (
+        "current_lora.safetensors",
+        "old_lora.safetensors",
+        "training_state.json",
+    )
+    if final_dir.is_dir():
+        for name in final_files:
+            require_nonempty_file(final_dir / name, f"final {name}")
+            if sha256_file(final_dir / name) != sha256_file(latest / name):
+                raise RuntimeError(f"Existing final export does not match latest: {name}")
+        return final_dir
+    temporary = run_dir / f".final.tmp-{os.getpid()}"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=False)
+    try:
+        for name in final_files:
+            shutil.copy2(latest / name, temporary / name)
+            require_nonempty_file(temporary / name, f"temporary final {name}")
+        temporary.replace(final_dir)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return final_dir
+
+
+def finalize_run(run_dir: Path, state: dict[str, Any]) -> Path:
+    final_dir = export_final(run_dir, state)
+    state["final"] = {
+        "path": str(final_dir),
+        "source_checkpoint": state["latest_checkpoint"],
+        "global_step": state["global_step"],
+        "current_lora_path": str(final_dir / "current_lora.safetensors"),
+        "current_lora_sha256": sha256_file(final_dir / "current_lora.safetensors"),
+        "old_lora_path": str(final_dir / "old_lora.safetensors"),
+        "old_lora_sha256": sha256_file(final_dir / "old_lora.safetensors"),
+        "training_state_path": str(final_dir / "training_state.json"),
+    }
+    write_json_atomic(run_dir / "online_state.json", state)
+    return final_dir
 
 
 def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
@@ -377,6 +609,7 @@ def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
         "learning_rate": args.learning_rate,
         "max_grad_norm": args.max_grad_norm,
         "old_decay_type": args.old_decay_type,
+        "keep_last_checkpoints": args.keep_last_checkpoints,
     }
 
 
@@ -392,7 +625,10 @@ def load_or_create_state(
         state = read_json(state_path)
         if state.get("format_version") != 1:
             raise ValueError(f"Unsupported online state format: {state.get('format_version')}")
-        if state.get("config") != config:
+        stored_config = state.get("config")
+        if isinstance(stored_config, dict) and "keep_last_checkpoints" not in stored_config:
+            stored_config = {**stored_config, "keep_last_checkpoints": 0}
+        if stored_config != config:
             raise ValueError("Resume online configuration does not match online_state.json")
         checkpoint_value = state.get("latest_checkpoint")
         if checkpoint_value is not None:
@@ -453,8 +689,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--old-decay-type", type=int, choices=(0, 1, 2), default=1)
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=0,
+        help="Keep only the newest N checkpoints after committed steps; 0 keeps all.",
+    )
     parser.add_argument("--use-gradient-checkpointing-offload", action="store_true")
     parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument(
+        "--engineering-stop-after",
+        choices=("rollout", "checkpoint"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--engineering-stop-iteration", type=int, default=None, help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 
@@ -465,6 +716,12 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, list[int]]:
         raise ValueError("Iterations must be positive and samples per prompt at least 2")
     if args.start < 0 or args.limit <= 0:
         raise ValueError("--start must be non-negative and --limit positive")
+    if args.keep_last_checkpoints < 0:
+        raise ValueError("--keep-last-checkpoints must be non-negative")
+    if (args.engineering_stop_after is None) != (
+        args.engineering_stop_iteration is None
+    ):
+        raise ValueError("Engineering stop stage and iteration must be set together")
     if args.output_dir is None and args.resume_from is None:
         raise ValueError("Provide --output-dir for a new run or --resume-from")
     if args.resume_from is not None:
@@ -497,9 +754,11 @@ def main() -> None:
     )
     first_iteration = int(state["completed_iteration"]) + 1
     if first_iteration >= args.num_iterations:
+        final_dir = finalize_run(run_dir, state)
         print(
             f"[online] target already complete: completed_iteration="
-            f"{state['completed_iteration']} global_step={state['global_step']}",
+            f"{state['completed_iteration']} global_step={state['global_step']} "
+            f"final={final_dir}",
             flush=True,
         )
         return
@@ -526,6 +785,7 @@ def main() -> None:
                 "dataset_position": dataset_position,
                 "seeds": seeds,
                 "rollout_path": str(rollout_json),
+                "iteration_started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                 **policy,
             }
             state["iterations"].append(existing)
@@ -547,9 +807,12 @@ def main() -> None:
         if rollout_json.is_file():
             try:
                 records, rollout_metrics = validate_rollout(
-                    rollout_json, policy, seeds
+                    rollout_json, policy, seeds, dataset_position, rollout_dir
                 )
                 rollout_valid = True
+                rollout_stage = existing.get("rollout_stage")
+                if not isinstance(rollout_stage, dict):
+                    rollout_stage = reused_stage_telemetry()
                 print(f"[online-resume] reuse_valid_rollout={rollout_json}", flush=True)
             except (OSError, TypeError, ValueError) as error:
                 print(f"[online-resume] rollout_not_complete={error}", flush=True)
@@ -587,9 +850,11 @@ def main() -> None:
                         "--source-checkpoint", policy["source_checkpoint"],
                     ]
                 )
-            run_streaming(rollout_command, iteration_dir / "rollout.log")
+            _, rollout_stage = run_streaming(
+                rollout_command, iteration_dir / "rollout.log"
+            )
             records, rollout_metrics = validate_rollout(
-                rollout_json, policy, seeds
+                rollout_json, policy, seeds, dataset_position, rollout_dir
             )
 
         if policy["policy_role"] == "old":
@@ -621,6 +886,10 @@ def main() -> None:
                 "rewards": rewards,
                 "reward_stats": reward_stats,
                 "rollout_metrics": rollout_metrics,
+                "rollout_stage": rollout_stage,
+                "reward_wall_time_seconds": reward_wall_time_from_log(
+                    iteration_dir / "rollout.log"
+                ),
             }
         )
         write_json_atomic(state_path, state)
@@ -633,6 +902,13 @@ def main() -> None:
             f"missing_face_samples={rollout_metrics['missing_face_samples']}",
             flush=True,
         )
+        if (
+            args.engineering_stop_after == "rollout"
+            and args.engineering_stop_iteration == iteration
+        ):
+            raise RuntimeError(
+                f"Engineering stop after rollout at iteration {iteration}"
+            )
 
         if checkpoint_dir.exists():
             checkpoint_state(checkpoint_dir, global_step_before + 1)
@@ -649,6 +925,9 @@ def main() -> None:
                 train_metrics = parse_train_metrics(
                     train_log.read_text(encoding="utf-8")
                 )
+            train_stage = existing.get("training_stage")
+            if not isinstance(train_stage, dict):
+                train_stage = reused_stage_telemetry()
         else:
             train_command = [
                 args.python,
@@ -677,9 +956,23 @@ def main() -> None:
                 train_command.append("--use-gradient-checkpointing-offload")
             if args.allow_download:
                 train_command.append("--allow-download")
-            train_output = run_streaming(train_command, iteration_dir / "train.log")
+            train_output, train_stage = run_streaming(
+                train_command, iteration_dir / "train.log"
+            )
             train_metrics = parse_train_metrics(train_output)
             checkpoint_state(checkpoint_dir, global_step_before + 1)
+
+        existing["train_metrics"] = train_metrics
+        existing["training_stage"] = train_stage
+        write_json_atomic(state_path, state)
+
+        if (
+            args.engineering_stop_after == "checkpoint"
+            and args.engineering_stop_iteration == iteration
+        ):
+            raise RuntimeError(
+                f"Engineering stop after checkpoint at iteration {iteration}"
+            )
 
         global_step_after = global_step_before + 1
         if train_metrics["global_step_before"] != global_step_before or train_metrics[
@@ -696,12 +989,31 @@ def main() -> None:
                 f"Advantage count {len(train_metrics['advantages'])} does not match "
                 f"group size {args.num_samples_per_prompt}"
             )
+        reward_wall_time = existing.get("reward_wall_time_seconds")
+        stage_metrics = {
+            "rollout_subprocess_exit_code": rollout_stage["subprocess_exit_code"],
+            "training_subprocess_exit_code": train_stage["subprocess_exit_code"],
+            "rollout_subprocess_executed": rollout_stage["subprocess_executed"],
+            "training_subprocess_executed": train_stage["subprocess_executed"],
+            "rollout_wall_time_seconds": rollout_stage["wall_time_seconds"],
+            "reward_wall_time_seconds": reward_wall_time,
+            "training_wall_time_seconds": train_stage["wall_time_seconds"],
+            "iteration_wall_time_seconds": (
+                float(rollout_stage["wall_time_seconds"])
+                + float(train_stage["wall_time_seconds"])
+            ),
+            "resource_before_rollout": rollout_stage["resource_before"],
+            "resource_after_rollout": rollout_stage["resource_after"],
+            "resource_before_training": train_stage["resource_before"],
+            "resource_after_training": train_stage["resource_after"],
+        }
         metrics = iteration_metrics(
             iteration,
             args.num_samples_per_prompt,
             policy,
             rollout_metrics,
             train_metrics,
+            stage_metrics,
             checkpoint_dir,
         )
         existing.update(
@@ -710,6 +1022,7 @@ def main() -> None:
                 "checkpoint": str(checkpoint_dir),
                 "global_step_after": global_step_after,
                 "train_metrics": train_metrics,
+                "training_stage": train_stage,
                 "metrics": metrics,
                 "iteration_success": True,
             }
@@ -723,7 +1036,22 @@ def main() -> None:
             }
         )
         write_json_atomic(state_path, state)
+        committed = read_json(state_path)
+        if (
+            committed.get("latest_checkpoint") != str(checkpoint_dir)
+            or committed.get("global_step") != global_step_after
+            or existing.get("rollout_path") != str(rollout_json)
+        ):
+            raise RuntimeError("Committed online state paths/step failed verification")
+        require_nonempty_file(rollout_json, "committed rollout.json")
+        checkpoint_state(checkpoint_dir, global_step_after)
         write_observability_outputs(run_dir, state)
+        removed = apply_checkpoint_retention(
+            run_dir, state, args.keep_last_checkpoints
+        )
+        if removed:
+            write_observability_outputs(run_dir, state)
+            print(f"[retention] removed_checkpoint_steps={removed}", flush=True)
         print(
             f"[online] iteration={iteration} global_step_before={global_step_before} "
             f"global_step_after={global_step_after} "
@@ -733,6 +1061,13 @@ def main() -> None:
             "iteration_success=true",
             flush=True,
         )
+
+    final_dir = finalize_run(run_dir, state)
+    print(
+        f"[final] path={final_dir} global_step={state['global_step']} "
+        f"current_lora_sha256={state['final']['current_lora_sha256']}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
