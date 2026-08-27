@@ -102,7 +102,7 @@ def validate_rollout(
     rollout_json: Path,
     expected: dict[str, Any],
     seeds: list[int],
-) -> tuple[list[dict[str, Any]], dict[str, float]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     payload = read_json(rollout_json)
     records = payload.get("rollouts") if isinstance(payload, dict) else payload
     if not isinstance(records, list) or len(records) != len(seeds):
@@ -117,6 +117,10 @@ def validate_rollout(
     if len(prompts) != 1 or not next(iter(prompts), None):
         raise ValueError("Online iteration must contain exactly one non-empty prompt group")
     rewards: list[float] = []
+    mean_qualities: list[float | None] = []
+    visible_ratios: list[float] = []
+    face_counts: list[int] = []
+    missing_face_samples = 0
     for index, record in enumerate(records):
         for key in ("video_path", "latent_path", "condition_image_path"):
             value = record.get(key)
@@ -132,11 +136,50 @@ def validate_rollout(
         if not isinstance(reward, (int, float)) or not math.isfinite(float(reward)):
             raise ValueError(f"Invalid reward at rollout record {index}: {reward}")
         rewards.append(float(reward))
+        mean_quality = record.get("mean_quality")
+        if mean_quality is not None and (
+            not isinstance(mean_quality, (int, float))
+            or not math.isfinite(float(mean_quality))
+        ):
+            raise ValueError(
+                f"Invalid mean_quality at rollout record {index}: {mean_quality}"
+            )
+        visible_ratio = record.get("face_visible_ratio")
+        face_count = record.get("num_faces")
+        if (
+            not isinstance(visible_ratio, (int, float))
+            or not math.isfinite(float(visible_ratio))
+            or not 0 <= float(visible_ratio) <= 1
+        ):
+            raise ValueError(
+                f"Invalid face_visible_ratio at rollout record {index}: {visible_ratio}"
+            )
+        if not isinstance(face_count, int) or isinstance(face_count, bool) or face_count < 0:
+            raise ValueError(f"Invalid num_faces at rollout record {index}: {face_count}")
+        mean_qualities.append(
+            float(mean_quality) if mean_quality is not None else None
+        )
+        visible_ratios.append(float(visible_ratio))
+        face_counts.append(face_count)
+        if mean_quality is None or face_count == 0:
+            missing_face_samples += 1
+    valid_qualities = [value for value in mean_qualities if value is not None]
     stats = {
-        "mean": statistics.fmean(rewards),
-        "std": statistics.pstdev(rewards),
-        "min": min(rewards),
-        "max": max(rewards),
+        "rewards": rewards,
+        "reward_mean": statistics.fmean(rewards),
+        "reward_std": statistics.pstdev(rewards),
+        "reward_min": min(rewards),
+        "reward_max": max(rewards),
+        "mean_quality": mean_qualities,
+        "mean_quality_mean": (
+            statistics.fmean(valid_qualities) if valid_qualities else None
+        ),
+        "face_visible_ratio": visible_ratios,
+        "face_visible_ratio_mean": statistics.fmean(visible_ratios),
+        "num_faces": face_counts,
+        "num_faces_total": sum(face_counts),
+        "missing_face_samples": missing_face_samples,
+        "missing_face_ratio": missing_face_samples / len(records),
     }
     return records, stats
 
@@ -166,19 +209,148 @@ def run_streaming(command: list[str], log_path: Path) -> str:
     return "".join(captured)
 
 
-def parse_train_metrics(output: str) -> dict[str, float]:
-    metrics: dict[str, float] = {}
+def parse_train_metrics(output: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
     patterns = {
+        "positive_loss": r"\[group\].*?positive_loss=([0-9eE+.-]+)",
+        "negative_loss": r"\[group\].*?negative_loss=([0-9eE+.-]+)",
+        "policy_loss": r"\[group\].*?policy_loss=([0-9eE+.-]+)",
         "kl_loss": r"\[group\].*?kl_loss=([0-9eE+.-]+)",
-        "current_old_distance": (
+        "total_loss": r"\[group\].*?total_loss=([0-9eE+.-]+)",
+        "gradient_norm": r"\[grad\].*?gradient_norm=([0-9eE+.-]+)",
+        "current_reference_prediction_distance": (
+            r"\[group\].*?current_reference_prediction_distance=([0-9eE+.-]+)"
+        ),
+        "current_old_parameter_distance": (
             r"current_old_parameter_distance_after=([0-9eE+.-]+)"
         ),
+        "old_decay": r"\[policies\].*?old_decay=([0-9eE+.-]+)",
     }
     for key, pattern in patterns.items():
         matches = re.findall(pattern, output)
         if matches:
             metrics[key] = float(matches[-1])
+    integer_patterns = {
+        "global_step_before": r"\[step\] global_step_before=(\d+)",
+        "global_step_after": r"\[step\] global_step_after=(\d+)",
+    }
+    for key, pattern in integer_patterns.items():
+        matches = re.findall(pattern, output)
+        if matches:
+            metrics[key] = int(matches[-1])
+    advantage_matches = re.findall(r"\[nft\] advantages=(\[[^\n]+\])", output)
+    if advantage_matches:
+        advantages = json.loads(advantage_matches[-1])
+        if not isinstance(advantages, list) or not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in advantages
+        ):
+            raise ValueError(f"Invalid advantages in training output: {advantages}")
+        metrics["advantages"] = [float(value) for value in advantages]
+    required = {
+        "positive_loss",
+        "negative_loss",
+        "policy_loss",
+        "kl_loss",
+        "total_loss",
+        "gradient_norm",
+        "current_reference_prediction_distance",
+        "current_old_parameter_distance",
+        "old_decay",
+        "global_step_before",
+        "global_step_after",
+        "advantages",
+    }
+    missing = sorted(required - set(metrics))
+    if missing:
+        raise ValueError(f"Training output is missing required metrics: {missing}")
     return metrics
+
+
+def iteration_metrics(
+    iteration: int,
+    group_size: int,
+    policy: dict[str, Any],
+    rollout_metrics: dict[str, Any],
+    train_metrics: dict[str, Any],
+    checkpoint: Path,
+) -> dict[str, Any]:
+    return {
+        "iteration": iteration,
+        "group_size": group_size,
+        "group_size_note": (
+            "K=2 engineering smoke only; normalized advantages are nearly +/-1"
+            if group_size == 2
+            else "K>=4 stability/experiment group"
+        ),
+        **policy,
+        **rollout_metrics,
+        **train_metrics,
+        "checkpoint": str(checkpoint),
+        "iteration_success": True,
+    }
+
+
+def write_observability_outputs(run_dir: Path, state: dict[str, Any]) -> None:
+    rows = [
+        item["metrics"]
+        for item in sorted(state.get("iterations", []), key=lambda value: value["iteration"])
+        if item.get("status") == "complete" and isinstance(item.get("metrics"), dict)
+    ]
+    metrics_path = run_dir / "metrics.jsonl"
+    temporary = metrics_path.with_suffix(metrics_path.suffix + f".tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(
+                json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            )
+    temporary.replace(metrics_path)
+
+    reward_means = [float(row["reward_mean"]) for row in rows]
+    reward_stds = [float(row["reward_std"]) for row in rows]
+    kl_values = [float(row["kl_loss"]) for row in rows]
+    gradient_norms = [float(row["gradient_norm"]) for row in rows]
+    reference_distances = [
+        float(row["current_reference_prediction_distance"]) for row in rows
+    ]
+    visible_means = [float(row["face_visible_ratio_mean"]) for row in rows]
+    missing_counts = [int(row["missing_face_samples"]) for row in rows]
+    sample_count = sum(len(row["rewards"]) for row in rows)
+    checkpoints = [row["checkpoint"] for row in rows]
+    summary = {
+        "iteration_count": len(rows),
+        "group_size": state.get("config", {}).get("num_samples_per_prompt"),
+        "group_size_note": (
+            "K=2 is an engineering-only smoke configuration"
+            if state.get("config", {}).get("num_samples_per_prompt") == 2
+            else "K>=4 provides non-degenerate group-relative reward information"
+        ),
+        "reward_mean_by_iteration": reward_means,
+        "reward_std_by_iteration": reward_stds,
+        "reward_initial": reward_means[0] if reward_means else None,
+        "reward_final": reward_means[-1] if reward_means else None,
+        "reward_change": (
+            reward_means[-1] - reward_means[0] if reward_means else None
+        ),
+        "kl_max": max(kl_values) if kl_values else None,
+        "kl_final": kl_values[-1] if kl_values else None,
+        "gradient_norm_max": max(gradient_norms) if gradient_norms else None,
+        "current_reference_distance_by_iteration": reference_distances,
+        "current_reference_distance_max": (
+            max(reference_distances) if reference_distances else None
+        ),
+        "current_reference_distance_final": (
+            reference_distances[-1] if reference_distances else None
+        ),
+        "face_visible_ratio_mean_by_iteration": visible_means,
+        "face_visible_ratio_initial": visible_means[0] if visible_means else None,
+        "face_visible_ratio_final": visible_means[-1] if visible_means else None,
+        "missing_face_samples_by_iteration": missing_counts,
+        "missing_face_samples": sum(missing_counts),
+        "missing_face_ratio": sum(missing_counts) / sample_count if sample_count else None,
+        "checkpoints": checkpoints,
+    }
+    write_json_atomic(run_dir / "training_summary.json", summary)
 
 
 def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
@@ -317,6 +489,12 @@ def main() -> None:
     config = stable_config(args, seeds)
     state_path = run_dir / "online_state.json"
     state = load_or_create_state(run_dir, args, config)
+    write_observability_outputs(run_dir, state)
+    print(
+        f"[group-size] K={args.num_samples_per_prompt} "
+        f"engineering_smoke_only={str(args.num_samples_per_prompt == 2).lower()}",
+        flush=True,
+    )
     first_iteration = int(state["completed_iteration"]) + 1
     if first_iteration >= args.num_iterations:
         print(
@@ -368,7 +546,9 @@ def main() -> None:
         rollout_valid = False
         if rollout_json.is_file():
             try:
-                records, reward_stats = validate_rollout(rollout_json, policy, seeds)
+                records, rollout_metrics = validate_rollout(
+                    rollout_json, policy, seeds
+                )
                 rollout_valid = True
                 print(f"[online-resume] reuse_valid_rollout={rollout_json}", flush=True)
             except (OSError, TypeError, ValueError) as error:
@@ -408,7 +588,9 @@ def main() -> None:
                     ]
                 )
             run_streaming(rollout_command, iteration_dir / "rollout.log")
-            records, reward_stats = validate_rollout(rollout_json, policy, seeds)
+            records, rollout_metrics = validate_rollout(
+                rollout_json, policy, seeds
+            )
 
         if policy["policy_role"] == "old":
             rollout_log = iteration_dir / "rollout.log"
@@ -427,18 +609,28 @@ def main() -> None:
             existing["rollout_policy_patched_modules"] = 104
 
         rewards = [float(record["reward"]) for record in records]
+        reward_stats = {
+            "mean": rollout_metrics["reward_mean"],
+            "std": rollout_metrics["reward_std"],
+            "min": rollout_metrics["reward_min"],
+            "max": rollout_metrics["reward_max"],
+        }
         existing.update(
             {
                 "status": "rollout_complete",
                 "rewards": rewards,
                 "reward_stats": reward_stats,
+                "rollout_metrics": rollout_metrics,
             }
         )
         write_json_atomic(state_path, state)
         print(
             f"[online] iteration={iteration} rewards={rewards} "
-            f"reward_mean={reward_stats['mean']:.8f} "
-            f"reward_std={reward_stats['std']:.8f}",
+            f"reward_mean={rollout_metrics['reward_mean']:.8f} "
+            f"reward_std={rollout_metrics['reward_std']:.8f} "
+            f"face_visible_ratio_mean="
+            f"{rollout_metrics['face_visible_ratio_mean']:.8f} "
+            f"missing_face_samples={rollout_metrics['missing_face_samples']}",
             flush=True,
         )
 
@@ -447,7 +639,16 @@ def main() -> None:
             print(
                 f"[online-resume] reuse_valid_checkpoint={checkpoint_dir}", flush=True
             )
-            train_metrics = existing.get("train_metrics", {})
+            train_metrics = existing.get("train_metrics")
+            if not isinstance(train_metrics, dict):
+                train_log = iteration_dir / "train.log"
+                if not train_log.is_file():
+                    raise FileNotFoundError(
+                        f"Recovered checkpoint has no training metrics log: {train_log}"
+                    )
+                train_metrics = parse_train_metrics(
+                    train_log.read_text(encoding="utf-8")
+                )
         else:
             train_command = [
                 args.python,
@@ -481,12 +682,35 @@ def main() -> None:
             checkpoint_state(checkpoint_dir, global_step_before + 1)
 
         global_step_after = global_step_before + 1
+        if train_metrics["global_step_before"] != global_step_before or train_metrics[
+            "global_step_after"
+        ] != global_step_after:
+            raise ValueError(
+                "Parsed training global steps do not match online state: "
+                f"{train_metrics['global_step_before']} -> "
+                f"{train_metrics['global_step_after']} vs "
+                f"{global_step_before} -> {global_step_after}"
+            )
+        if len(train_metrics["advantages"]) != args.num_samples_per_prompt:
+            raise ValueError(
+                f"Advantage count {len(train_metrics['advantages'])} does not match "
+                f"group size {args.num_samples_per_prompt}"
+            )
+        metrics = iteration_metrics(
+            iteration,
+            args.num_samples_per_prompt,
+            policy,
+            rollout_metrics,
+            train_metrics,
+            checkpoint_dir,
+        )
         existing.update(
             {
                 "status": "complete",
                 "checkpoint": str(checkpoint_dir),
                 "global_step_after": global_step_after,
                 "train_metrics": train_metrics,
+                "metrics": metrics,
                 "iteration_success": True,
             }
         )
@@ -499,10 +723,12 @@ def main() -> None:
             }
         )
         write_json_atomic(state_path, state)
+        write_observability_outputs(run_dir, state)
         print(
             f"[online] iteration={iteration} global_step_before={global_step_before} "
             f"global_step_after={global_step_after} "
-            f"current_old_distance={train_metrics.get('current_old_distance')} "
+            f"current_old_distance="
+            f"{train_metrics.get('current_old_parameter_distance')} "
             f"kl_loss={train_metrics.get('kl_loss')} checkpoint={checkpoint_dir} "
             "iteration_success=true",
             flush=True,
