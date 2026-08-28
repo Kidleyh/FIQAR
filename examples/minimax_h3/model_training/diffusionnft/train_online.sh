@@ -31,6 +31,7 @@ OLD_DECAY_TYPE="${OLD_DECAY_TYPE:-1}"
 FLOW_SHIFT="${FLOW_SHIFT:-12}"
 AUDIO_FLOW_SHIFT="${AUDIO_FLOW_SHIFT:-3}"
 REWARD_FRAME_STRIDE="${REWARD_FRAME_STRIDE:-6}"
+SAVE_ROLLOUT_VIDEO="${SAVE_ROLLOUT_VIDEO:-0}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-qkv_proj,out_proj}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 KEEP_LAST_CHECKPOINTS="${KEEP_LAST_CHECKPOINTS:-0}"
@@ -43,6 +44,10 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 read -r -a SEED_ARGS <<< "${SEEDS}"
 if [[ "${#SEED_ARGS[@]}" -ne "${NUM_SAMPLES}" ]]; then
   echo "SEEDS must contain exactly NUM_SAMPLES=${NUM_SAMPLES} values" >&2
+  exit 2
+fi
+if [[ "${SAVE_ROLLOUT_VIDEO}" != "0" && "${SAVE_ROLLOUT_VIDEO}" != "1" ]]; then
+  echo "SAVE_ROLLOUT_VIDEO must be 0 or 1" >&2
   exit 2
 fi
 
@@ -80,6 +85,10 @@ if [[ -n "${RESUME_FROM}" ]]; then
   RUN_ARGS+=(--resume-from "${RESUME_FROM}")
 else
   RUN_ARGS+=(--output-dir "${OUTPUT_DIR}")
+fi
+
+if [[ "${SAVE_ROLLOUT_VIDEO}" == "1" ]]; then
+  RUN_ARGS+=(--save-rollout-video)
 fi
 
 exec "${PYTHON_BIN}" examples/minimax_h3/model_training/diffusionnft/online_train.py "${RUN_ARGS[@]}"

@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +41,12 @@ from minimax_h3_stage1_pair_render import (  # noqa: E402
     safe_folder_name,
     validate_requested_frames,
 )
-from reward_face_quality import DEFAULT_EVALUATOR, evaluate_face_quality  # noqa: E402
+from reward_face_quality import (  # noqa: E402
+    DEFAULT_EVALUATOR,
+    DEFAULT_MAGFACE_CHECKPOINT,
+    DEFAULT_SCRFD_MODEL,
+    FaceQualityReward,
+)
 
 
 DEFAULT_DATA_JSON = Path(
@@ -76,6 +84,46 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _valid_complete_state(
+    state_path: Path, expected: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str]:
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return None, "state is not an object"
+        for key, value in expected.items():
+            if state.get(key) != value:
+                return None, f"{key} mismatch: {state.get(key)!r} != {value!r}"
+        if state.get("format_version") != 1 or state.get("complete") is not True:
+            return None, "state is not a committed format-version 1 sample"
+        latent_path = Path(state["latent_path"]).resolve()
+        condition_path = Path(state["condition_image_path"]).resolve()
+        for path, label in ((latent_path, "latent"), (condition_path, "condition")):
+            if not path.is_file() or path.stat().st_size <= 0:
+                return None, f"missing or empty {label}: {path}"
+        if _sha256(latent_path) != state.get("latent_sha256"):
+            return None, "latent sha256 mismatch"
+        if _sha256(condition_path) != state.get("condition_image_sha256"):
+            return None, "condition sha256 mismatch"
+        reward = state.get("reward")
+        ratio = state.get("face_visible_ratio")
+        faces = state.get("num_faces")
+        quality = state.get("mean_quality")
+        if not isinstance(reward, (int, float)) or not math.isfinite(float(reward)):
+            return None, "invalid reward"
+        if quality is not None and (
+            not isinstance(quality, (int, float)) or not math.isfinite(float(quality))
+        ):
+            return None, "invalid mean_quality"
+        if not isinstance(ratio, (int, float)) or not 0 <= float(ratio) <= 1:
+            return None, "invalid face_visible_ratio"
+        if not isinstance(faces, int) or isinstance(faces, bool) or faces < 0:
+            return None, "invalid num_faces"
+        return state, "valid"
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        return None, str(error)
 
 
 def _resolve_policy_provenance(args: argparse.Namespace) -> dict[str, Any]:
@@ -195,11 +243,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-checkpoint", type=Path, default=None)
     parser.add_argument("--global-step-before", type=int, default=None)
     parser.add_argument("--reward-evaluator", type=Path, default=DEFAULT_EVALUATOR)
-    parser.add_argument("--reward-python", default=sys.executable)
-    parser.add_argument("--conda-executable", default="/root/miniconda3/bin/conda")
+    parser.add_argument("--scrfd-model", type=Path, default=DEFAULT_SCRFD_MODEL)
+    parser.add_argument(
+        "--magface-checkpoint", type=Path, default=DEFAULT_MAGFACE_CHECKPOINT
+    )
     parser.add_argument("--reward-frame-stride", type=int, default=25)
     parser.add_argument("--reward-max-frames", type=int, default=0)
+    parser.add_argument(
+        "--reward-frame-face-aggregation",
+        choices=("mean", "min", "max"),
+        default="mean",
+    )
     parser.add_argument("--missing-face-reward", type=float, default=0.0)
+    parser.add_argument(
+        "--save-rollout-video",
+        action="store_true",
+        help="Write debug mp4 artifacts; formal training defaults to latent/state only.",
+    )
+    parser.add_argument(
+        "--engineering-stop-after-state-seed", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--engineering-stop-after-latent-seed", type=int, default=None, help=argparse.SUPPRESS
+    )
     return parser.parse_args()
 
 
@@ -235,9 +301,22 @@ def main() -> None:
     )
 
     pipe = build_pipeline(args)
-    from diffsynth.utils.data.audio_video import write_video_audio
+    reward_init_started = time.monotonic()
+    reward_model = FaceQualityReward(
+        evaluator_path=args.reward_evaluator,
+        scrfd_model=args.scrfd_model,
+        magface_checkpoint=args.magface_checkpoint,
+        device=args.device,
+    )
+    reward_init_seconds = time.monotonic() - reward_init_started
+    print(
+        f"[reward-inmemory] model_init_seconds={reward_init_seconds:.6f}", flush=True
+    )
+    if args.save_rollout_video:
+        from diffsynth.utils.data.audio_video import write_video_audio
 
-    generated: list[dict[str, Any]] = []
+    rollouts: list[dict[str, Any]] = []
+    reward_wall_time = reward_init_seconds
     used_names: set[str] = set()
     for record_index, record in records:
         source_video = load_video_path_from_record(record).expanduser().resolve()
@@ -253,7 +332,11 @@ def main() -> None:
         prompt_dir = args.output_dir / f"prompt_{record_index:06d}_{folder_name}"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         condition_path = (prompt_dir / "condition_image.png").resolve()
-        first_frame.save(condition_path, format="PNG")
+        condition_temporary = condition_path.with_suffix(
+            condition_path.suffix + f".tmp-{os.getpid()}"
+        )
+        first_frame.save(condition_temporary, format="PNG")
+        condition_temporary.replace(condition_path)
         with Image.open(condition_path) as saved_condition:
             condition_image = saved_condition.convert("RGB").copy()
         condition_sha256 = _sha256(condition_path)
@@ -266,15 +349,49 @@ def main() -> None:
         for seed in seeds:
             video_path = (prompt_dir / f"seed_{seed}.mp4").resolve()
             latent_path = (prompt_dir / f"seed_{seed}_latents.safetensors").resolve()
-            if (
-                args.skip_existing
-                and video_path.is_file()
-                and video_path.stat().st_size > 0
-                and latent_path.is_file()
-                and latent_path.stat().st_size > 0
-            ):
-                print(f"[rollout] reuse seed={seed} video={video_path}", flush=True)
-            else:
+            state_path = (prompt_dir / f"seed_{seed}_state.json").resolve()
+            prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            expected_state = {
+                "format_version": 1,
+                "complete": True,
+                "seed": seed,
+                "latent_path": str(latent_path),
+                "condition_image_path": str(condition_path),
+                "condition_image_sha256": condition_sha256,
+                "prompt": prompt,
+                "prompt_sha256": prompt_sha256,
+                **policy_provenance,
+                "height": render_height,
+                "width": render_width,
+                "num_frames": frame_count,
+                "num_inference_steps": args.num_inference_steps,
+                "flow_shift": args.flow_shift,
+                "audio_flow_shift": args.audio_flow_shift,
+                "save_rollout_video": args.save_rollout_video,
+                "video_path": str(video_path) if args.save_rollout_video else None,
+            }
+            state = None
+            if args.skip_existing and state_path.is_file():
+                state, reason = _valid_complete_state(state_path, expected_state)
+                if state is not None and args.save_rollout_video and (
+                    not video_path.is_file() or video_path.stat().st_size <= 0
+                ):
+                    print(
+                        f"[rollout-resume] seed={seed} formal_state_valid=true "
+                        "debug_video_missing=true regenerate_for_requested_video=true",
+                        flush=True,
+                    )
+                    state = None
+                elif state is not None:
+                    print(
+                        f"[rollout-resume] reuse seed={seed} state={state_path}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[rollout-resume] reject seed={seed} reason={reason}", flush=True
+                    )
+            if state is None:
                 print(f"[rollout] generate record={record_index} seed={seed}", flush=True)
                 video, audio, clean_latents = pipe(
                     prompt=prompt,
@@ -296,72 +413,72 @@ def main() -> None:
                     raise RuntimeError(
                         f"Pipeline returned {len(video)} frames, expected {frame_count}"
                     )
-                write_video_audio(
-                    video=video,
-                    audio=audio,
-                    output_path=str(video_path),
-                    fps=H3_FPS,
-                    audio_sample_rate=pipe.audio_vae.sample_rate,
-                    video_quality=8,
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                reward_started = time.monotonic()
+                reward = reward_model.score_frames(
+                    video,
+                    frame_stride=args.reward_frame_stride,
+                    max_frames_per_video=args.reward_max_frames,
+                    frame_face_aggregation=args.reward_frame_face_aggregation,
+                    missing_face_reward=args.missing_face_reward,
+                )
+                elapsed = time.monotonic() - reward_started
+                reward_wall_time += elapsed
+                print(
+                    f"[reward-inmemory] seed={seed} reward={reward['reward']:.8f} "
+                    f"elapsed_seconds={elapsed:.6f}",
+                    flush=True,
                 )
                 _write_latents(latent_path, clean_latents)
-            generated.append(
-                {
-                    "prompt": prompt,
-                    "seed": seed,
-                    "video_path": str(video_path),
-                    "latent_path": str(latent_path),
-                    "condition_image_path": str(condition_path),
-                    "condition_image_sha256": condition_sha256,
-                    "height": render_height,
-                    "width": render_width,
-                    "num_frames": frame_count,
+                if args.engineering_stop_after_latent_seed == seed:
+                    raise RuntimeError(
+                        f"Engineering stop after latent before state for seed={seed}"
+                    )
+                if args.save_rollout_video:
+                    write_video_audio(
+                        video=video,
+                        audio=audio,
+                        output_path=str(video_path),
+                        fps=H3_FPS,
+                        audio_sample_rate=pipe.audio_vae.sample_rate,
+                        video_quality=8,
+                    )
+                state = {
+                    **expected_state,
+                    "reward": float(reward["reward"]),
+                    "mean_quality": reward["mean_quality"],
+                    "face_visible_ratio": float(reward["face_visible_ratio"]),
+                    "num_faces": int(reward["num_faces"]),
+                    "latent_sha256": _sha256(latent_path),
                     "fps": H3_FPS,
-                    **policy_provenance,
-                    "num_inference_steps": args.num_inference_steps,
-                    "flow_shift": args.flow_shift,
-                    "audio_flow_shift": args.audio_flow_shift,
+                    "reward_backend": "in_memory",
                 }
+                _write_json(state_path, state)
+                if args.engineering_stop_after_state_seed == seed:
+                    raise RuntimeError(f"Engineering stop after state for seed={seed}")
+                del video, audio, clean_latents
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            result = {**state, "sample_state_path": str(state_path)}
+            rollouts.append(result)
+            print(
+                f"[result] seed={result['seed']} reward={result['reward']:.6f} "
+                f"visible_ratio={result['face_visible_ratio']:.3f} "
+                f"num_faces={result['num_faces']} video={result['video_path']} "
+                f"state={state_path}",
+                flush=True,
             )
-
-    # The external evaluator needs only the rendered files. Release H3 model
-    # allocations before SCRFD and MagFace enter their own CUDA environments.
-    del pipe
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    reward_dir = args.output_dir / "reward_eval"
-    rewards = evaluate_face_quality(
-        [item["video_path"] for item in generated],
-        reward_dir,
-        evaluator_path=args.reward_evaluator,
-        python_executable=args.reward_python,
-        conda_executable=args.conda_executable,
-        frame_stride=args.reward_frame_stride,
-        max_frames_per_video=args.reward_max_frames,
-        missing_face_reward=args.missing_face_reward,
-    )
-
-    rollouts = []
-    for item in generated:
-        reward = rewards[str(Path(item["video_path"]).resolve())]
-        result = {
-            **item,
-            "reward": reward["reward"],
-            "mean_quality": reward["mean_quality"],
-            "face_visible_ratio": reward["face_visible_ratio"],
-            "num_faces": reward["num_faces"],
-        }
-        rollouts.append(result)
-        print(
-            f"[result] seed={result['seed']} reward={result['reward']:.6f} "
-            f"visible_ratio={result['face_visible_ratio']:.3f} "
-            f"num_faces={result['num_faces']} video={result['video_path']}",
-            flush=True,
-        )
 
     rollout_path = args.output_dir / "rollout.json"
     _write_json(rollout_path, rollouts)
+    print(
+        f"[reward-inmemory-summary] reward_wall_time_seconds={reward_wall_time:.6f}",
+        flush=True,
+    )
+    del reward_model, pipe
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print(f"[done] rollout_json={rollout_path}", flush=True)
 
 

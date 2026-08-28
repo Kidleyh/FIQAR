@@ -153,6 +153,7 @@ def validate_rollout(
     seeds: list[int],
     dataset_position: int,
     rollout_dir: Path,
+    save_rollout_video: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     require_nonempty_file(rollout_json, "rollout.json")
     payload = read_json(rollout_json)
@@ -178,37 +179,81 @@ def validate_rollout(
     condition_paths: set[Path] = set()
     video_paths: set[Path] = set()
     latent_paths: set[Path] = set()
+    state_paths: set[Path] = set()
     for index, record in enumerate(records):
-        for key in ("video_path", "latent_path", "condition_image_path"):
+        for key in ("latent_path", "condition_image_path", "sample_state_path"):
             value = record.get(key)
             if not isinstance(value, str):
                 raise FileNotFoundError(f"Rollout record {index} missing {key}: {value}")
             require_nonempty_file(Path(value), f"rollout record {index} {key}")
-        video_path = Path(record["video_path"]).resolve()
         latent_path = Path(record["latent_path"]).resolve()
         condition_path = Path(record["condition_image_path"]).resolve()
-        prompt_dir = video_path.parent
+        sample_state_path = Path(record["sample_state_path"]).resolve()
+        prompt_dir = latent_path.parent
         if prompt_dir.parent != rollout_dir:
             raise ValueError(
-                f"Rollout record {index} is outside current rollout directory: {video_path}"
+                f"Rollout record {index} is outside current rollout directory: {latent_path}"
             )
         if not prompt_dir.name.startswith(f"prompt_{dataset_position:06d}_"):
             raise ValueError(
                 f"Rollout record {index} belongs to the wrong dataset position: "
                 f"{prompt_dir.name} != prompt_{dataset_position:06d}_*"
             )
-        if latent_path.parent != prompt_dir or condition_path.parent != prompt_dir:
+        if condition_path.parent != prompt_dir or sample_state_path.parent != prompt_dir:
             raise ValueError(
                 f"Rollout record {index} mixes prompt artifact directories"
             )
-        if video_path.name != f"seed_{record.get('seed')}.mp4" or latent_path.name != (
-            f"seed_{record.get('seed')}_latents.safetensors"
+        seed = record.get("seed")
+        if (
+            latent_path.name != f"seed_{seed}_latents.safetensors"
+            or sample_state_path.name != f"seed_{seed}_state.json"
         ):
             raise ValueError(f"Rollout record {index} seed/artifact names do not match")
+        sample_state = read_json(sample_state_path)
+        if not isinstance(sample_state, dict) or sample_state.get("format_version") != 1:
+            raise ValueError(f"Rollout record {index} has invalid sample state format")
+        if sample_state.get("complete") is not True:
+            raise ValueError(f"Rollout record {index} sample state is not complete")
+        contract_keys = (
+            "seed", "reward", "mean_quality", "face_visible_ratio", "num_faces",
+            "latent_path", "latent_sha256", "condition_image_path",
+            "condition_image_sha256", "prompt", "prompt_sha256", "policy_role",
+            "policy_lora_path", "policy_lora_sha256", "source_checkpoint",
+            "global_step_before", "height", "width", "num_frames",
+            "num_inference_steps", "flow_shift", "audio_flow_shift", "video_path",
+            "save_rollout_video",
+        )
+        mismatches = [
+            key for key in contract_keys if sample_state.get(key) != record.get(key)
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Rollout record {index} differs from committed sample state: {mismatches}"
+            )
+        if sha256_file(latent_path) != record.get("latent_sha256"):
+            raise ValueError(f"Rollout record {index} latent sha256 mismatch")
+        if sha256_file(condition_path) != record.get("condition_image_sha256"):
+            raise ValueError(f"Rollout record {index} condition sha256 mismatch")
+        expected_prompt_hash = hashlib.sha256(record["prompt"].encode("utf-8")).hexdigest()
+        if record.get("prompt_sha256") != expected_prompt_hash:
+            raise ValueError(f"Rollout record {index} prompt sha256 mismatch")
+        video_value = record.get("video_path")
+        if save_rollout_video:
+            if not isinstance(video_value, str):
+                raise FileNotFoundError(f"Rollout record {index} missing debug video")
+            video_path = Path(video_value).resolve()
+            require_nonempty_file(video_path, f"rollout record {index} debug video")
+            if video_path.parent != prompt_dir or video_path.name != f"seed_{seed}.mp4":
+                raise ValueError(f"Rollout record {index} debug video path mismatch")
+            video_paths.add(video_path)
+        elif video_value is not None:
+            raise ValueError(
+                f"Formal no-video rollout record {index} unexpectedly has video_path"
+            )
         prompt_directories.add(prompt_dir)
         condition_paths.add(condition_path)
-        video_paths.add(video_path)
         latent_paths.add(latent_path)
+        state_paths.add(sample_state_path)
         actual = {key: record.get(key) for key in expected}
         if actual != expected:
             raise ValueError(
@@ -248,8 +293,10 @@ def validate_rollout(
             missing_face_samples += 1
     if len(prompt_directories) != 1 or len(condition_paths) != 1:
         raise ValueError("Online group must use exactly one prompt directory/condition")
-    if len(video_paths) != len(records) or len(latent_paths) != len(records):
-        raise ValueError("Online group contains duplicate video or latent artifacts")
+    if len(latent_paths) != len(records) or len(state_paths) != len(records):
+        raise ValueError("Online group contains duplicate latent or sample-state artifacts")
+    if save_rollout_video and len(video_paths) != len(records):
+        raise ValueError("Online group contains duplicate debug video artifacts")
     valid_qualities = [value for value in mean_qualities if value is not None]
     stats = {
         "dataset_position": dataset_position,
@@ -324,9 +371,16 @@ def reused_stage_telemetry() -> dict[str, Any]:
 def reward_wall_time_from_log(log_path: Path) -> float | None:
     if not log_path.is_file():
         return None
+    text = log_path.read_text(encoding="utf-8")
+    in_memory = re.findall(
+        r"\[reward-inmemory-summary\] reward_wall_time_seconds=([0-9eE+.-]+)",
+        text,
+    )
+    if in_memory:
+        return float(in_memory[-1])
     matches = re.findall(
         r'"elapsed_seconds"\s*:\s*([0-9eE+.-]+)',
-        log_path.read_text(encoding="utf-8"),
+        text,
     )
     return float(matches[-1]) if matches else None
 
@@ -600,6 +654,7 @@ def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
         "flow_shift": args.flow_shift,
         "audio_flow_shift": args.audio_flow_shift,
         "reward_frame_stride": args.reward_frame_stride,
+        "save_rollout_video": args.save_rollout_video,
         "lora_rank": args.lora_rank,
         "lora_target_modules": args.lora_target_modules,
         "timestep_fraction": args.timestep_fraction,
@@ -680,6 +735,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-flow-shift", type=float, default=3.0)
     parser.add_argument("--vram-limit-gb", type=float, default=None)
     parser.add_argument("--reward-frame-stride", type=int, default=25)
+    parser.add_argument(
+        "--save-rollout-video",
+        action="store_true",
+        help="Write optional debug mp4 files; formal rollout is latent/state only.",
+    )
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-target-modules", default="qkv_proj,out_proj")
     parser.add_argument("--timestep-fraction", type=float, default=0.99)
@@ -807,7 +867,8 @@ def main() -> None:
         if rollout_json.is_file():
             try:
                 records, rollout_metrics = validate_rollout(
-                    rollout_json, policy, seeds, dataset_position, rollout_dir
+                    rollout_json, policy, seeds, dataset_position, rollout_dir,
+                    args.save_rollout_video,
                 )
                 rollout_valid = True
                 rollout_stage = existing.get("rollout_stage")
@@ -842,6 +903,8 @@ def main() -> None:
                 rollout_command.extend(["--vram-limit-gb", str(args.vram_limit_gb)])
             if args.allow_download:
                 rollout_command.append("--allow-download")
+            if args.save_rollout_video:
+                rollout_command.append("--save-rollout-video")
             if policy["policy_role"] == "old":
                 rollout_command.extend(
                     [
@@ -854,7 +917,8 @@ def main() -> None:
                 rollout_command, iteration_dir / "rollout.log"
             )
             records, rollout_metrics = validate_rollout(
-                rollout_json, policy, seeds, dataset_position, rollout_dir
+                rollout_json, policy, seeds, dataset_position, rollout_dir,
+                args.save_rollout_video,
             )
 
         if policy["policy_role"] == "old":

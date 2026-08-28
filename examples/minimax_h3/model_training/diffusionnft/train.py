@@ -69,8 +69,8 @@ def load_rollout_records(path: Path) -> list[dict[str, Any]]:
         if not isinstance(record.get("prompt"), str) or not record["prompt"].strip():
             raise ValueError(f"Rollout record {index} has no prompt")
         video_path = record.get("video_path")
-        if not isinstance(video_path, str) or not Path(video_path).is_file():
-            raise FileNotFoundError(f"Rollout record {index} video does not exist: {video_path}")
+        if video_path is not None and not isinstance(video_path, str):
+            raise TypeError(f"Rollout record {index} has invalid video_path: {video_path}")
         validated.append(record)
     return validated
 
@@ -765,7 +765,13 @@ def run_backward_smoke(
     device: torch.device,
     current_parameters: list[torch.nn.Parameter],
 ) -> None:
-    frames, fps = decode_video_frames(record["video_path"])
+    video_path = record.get("video_path")
+    if not isinstance(video_path, str) or not Path(video_path).is_file():
+        raise FileNotFoundError(
+            "backward-smoke is the legacy mp4 diagnostic and requires video_path: "
+            f"{video_path}"
+        )
+    frames, fps = decode_video_frames(video_path)
     print(
         f"[input] video={record['video_path']} frames={len(frames)} fps={fps:.3f} "
         f"size={frames[0].size[0]}x{frames[0].size[1]}",
