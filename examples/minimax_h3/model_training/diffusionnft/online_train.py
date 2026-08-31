@@ -26,6 +26,14 @@ DEFAULT_DATA_JSON = Path(
     "/gemini/platform/public/aigc/human_guozz2/code/lyh/job/PhyMotion/outputs/"
     "guangdian_20251114_small_clear_faces/guangdian_20251114_small_clear_faces.json"
 )
+DEFAULT_SCRFD_MODEL = Path(
+    "/gemini/platform/public/aigc/human_guozz2/code/lyh/job/insightface/"
+    "models/scrfd_10g_bnkps.onnx"
+)
+DEFAULT_MAGFACE_CHECKPOINT = Path(
+    "/gemini/platform/public/aigc/human_guozz2/code/lyh/job/MagFace/"
+    "checkpoints/magface_iresnet100_quality.pth"
+)
 CHECKPOINT_FILES = (
     "current_lora.safetensors",
     "old_lora.safetensors",
@@ -40,6 +48,21 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def reward_provenance(args: argparse.Namespace) -> dict[str, Any]:
+    scrfd_model = args.scrfd_model.expanduser().resolve()
+    magface_checkpoint = args.magface_checkpoint.expanduser().resolve()
+    require_nonempty_file(scrfd_model, "SCRFD model")
+    require_nonempty_file(magface_checkpoint, "MagFace checkpoint")
+    return {
+        "reward_frame_stride": args.reward_frame_stride,
+        "reward_max_frames": args.reward_max_frames,
+        "reward_frame_face_aggregation": args.reward_frame_face_aggregation,
+        "missing_face_reward": args.missing_face_reward,
+        "scrfd_model_sha256": sha256_file(scrfd_model),
+        "magface_checkpoint_sha256": sha256_file(magface_checkpoint),
+    }
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -154,6 +177,7 @@ def validate_rollout(
     dataset_position: int,
     rollout_dir: Path,
     save_rollout_video: bool,
+    expected_reward_provenance: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     require_nonempty_file(rollout_json, "rollout.json")
     payload = read_json(rollout_json)
@@ -222,6 +246,9 @@ def validate_rollout(
             "global_step_before", "height", "width", "num_frames",
             "num_inference_steps", "flow_shift", "audio_flow_shift", "video_path",
             "save_rollout_video",
+            "reward_frame_stride", "reward_max_frames",
+            "reward_frame_face_aggregation", "missing_face_reward",
+            "scrfd_model_sha256", "magface_checkpoint_sha256",
         )
         mismatches = [
             key for key in contract_keys if sample_state.get(key) != record.get(key)
@@ -229,6 +256,15 @@ def validate_rollout(
         if mismatches:
             raise ValueError(
                 f"Rollout record {index} differs from committed sample state: {mismatches}"
+            )
+        actual_reward_provenance = {
+            key: record.get(key) for key in expected_reward_provenance
+        }
+        if actual_reward_provenance != expected_reward_provenance:
+            raise ValueError(
+                f"Rollout record {index} reward provenance mismatch: "
+                f"actual={actual_reward_provenance} "
+                f"expected={expected_reward_provenance}"
             )
         if sha256_file(latent_path) != record.get("latent_sha256"):
             raise ValueError(f"Rollout record {index} latent sha256 mismatch")
@@ -639,7 +675,11 @@ def finalize_run(run_dir: Path, state: dict[str, Any]) -> Path:
     return final_dir
 
 
-def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
+def stable_config(
+    args: argparse.Namespace,
+    seeds: list[int],
+    reward_contract: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "data_json": str(args.data_json.expanduser().resolve()),
         "num_samples_per_prompt": args.num_samples_per_prompt,
@@ -653,7 +693,9 @@ def stable_config(args: argparse.Namespace, seeds: list[int]) -> dict[str, Any]:
         "num_inference_steps": args.num_inference_steps,
         "flow_shift": args.flow_shift,
         "audio_flow_shift": args.audio_flow_shift,
-        "reward_frame_stride": args.reward_frame_stride,
+        **reward_contract,
+        "scrfd_model": str(args.scrfd_model.expanduser().resolve()),
+        "magface_checkpoint": str(args.magface_checkpoint.expanduser().resolve()),
         "save_rollout_video": args.save_rollout_video,
         "lora_rank": args.lora_rank,
         "lora_target_modules": args.lora_target_modules,
@@ -735,6 +777,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-flow-shift", type=float, default=3.0)
     parser.add_argument("--vram-limit-gb", type=float, default=None)
     parser.add_argument("--reward-frame-stride", type=int, default=25)
+    parser.add_argument("--reward-max-frames", type=int, default=0)
+    parser.add_argument(
+        "--reward-frame-face-aggregation",
+        choices=("mean", "min", "max"),
+        default="mean",
+    )
+    parser.add_argument("--missing-face-reward", type=float, default=0.0)
+    parser.add_argument("--scrfd-model", type=Path, default=DEFAULT_SCRFD_MODEL)
+    parser.add_argument(
+        "--magface-checkpoint", type=Path, default=DEFAULT_MAGFACE_CHECKPOINT
+    )
     parser.add_argument(
         "--save-rollout-video",
         action="store_true",
@@ -776,6 +829,10 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, list[int]]:
         raise ValueError("Iterations must be positive and samples per prompt at least 2")
     if args.start < 0 or args.limit <= 0:
         raise ValueError("--start must be non-negative and --limit positive")
+    if args.reward_frame_stride <= 0 or args.reward_max_frames < 0:
+        raise ValueError("Reward frame stride must be positive and max frames non-negative")
+    if not math.isfinite(args.missing_face_reward):
+        raise ValueError("--missing-face-reward must be finite")
     if args.keep_last_checkpoints < 0:
         raise ValueError("--keep-last-checkpoints must be non-negative")
     if (args.engineering_stop_after is None) != (
@@ -803,7 +860,8 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, list[int]]:
 def main() -> None:
     args = parse_args()
     run_dir, seeds = validate_args(args)
-    config = stable_config(args, seeds)
+    reward_contract = reward_provenance(args)
+    config = stable_config(args, seeds, reward_contract)
     state_path = run_dir / "online_state.json"
     state = load_or_create_state(run_dir, args, config)
     write_observability_outputs(run_dir, state)
@@ -868,7 +926,7 @@ def main() -> None:
             try:
                 records, rollout_metrics = validate_rollout(
                     rollout_json, policy, seeds, dataset_position, rollout_dir,
-                    args.save_rollout_video,
+                    args.save_rollout_video, reward_contract,
                 )
                 rollout_valid = True
                 rollout_stage = existing.get("rollout_stage")
@@ -895,6 +953,12 @@ def main() -> None:
                 "--flow-shift", str(args.flow_shift),
                 "--audio-flow-shift", str(args.audio_flow_shift),
                 "--reward-frame-stride", str(args.reward_frame_stride),
+                "--reward-max-frames", str(args.reward_max_frames),
+                "--reward-frame-face-aggregation", args.reward_frame_face_aggregation,
+                "--missing-face-reward", str(args.missing_face_reward),
+                "--scrfd-model", str(args.scrfd_model.expanduser().resolve()),
+                "--magface-checkpoint",
+                str(args.magface_checkpoint.expanduser().resolve()),
                 "--policy-role", policy["policy_role"],
                 "--global-step-before", str(global_step_before),
                 "--skip-existing",
@@ -918,7 +982,7 @@ def main() -> None:
             )
             records, rollout_metrics = validate_rollout(
                 rollout_json, policy, seeds, dataset_position, rollout_dir,
-                args.save_rollout_video,
+                args.save_rollout_video, reward_contract,
             )
 
         if policy["policy_role"] == "old":

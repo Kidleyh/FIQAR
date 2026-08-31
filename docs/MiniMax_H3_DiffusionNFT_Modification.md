@@ -10,6 +10,18 @@
 
 ## Change history
 
+### 2026-08-31 — phase 8.1 reward provenance for seed resume
+
+- **Modification goal:** make the mp4-free per-seed resume contract sensitive to the complete face-reward configuration and the exact SCRFD/MagFace weights. Reward computation, DiffusionNFT loss, policy/scheduler/checkpoint behavior, and the Phase-8 in-memory rollout path are unchanged.
+- **Modified files:** `examples/minimax_h3/model_training/diffusionnft/rollout.py` and `examples/minimax_h3/model_training/diffusionnft/online_train.py`.
+- **New test script:** `examples/minimax_h3/model_training/diffusionnft/smoke_reward_provenance_resume.sh`.
+- **Committed seed contract:** every `seed_<N>_state.json` and corresponding `rollout.json` record now stores `reward_frame_stride`, `reward_max_frames`, `reward_frame_face_aggregation`, `missing_face_reward`, `scrfd_model_sha256`, and `magface_checkpoint_sha256`. `rollout.py` resolves and SHA-256 hashes both checkpoints once during process initialization, before the K-seed loop.
+- **Strict seed reuse:** the six fields are included in the existing `_valid_complete_state()` expected contract. A missing field, reward-configuration difference, or checkpoint-content hash difference rejects the state and regenerates/rewards that seed; old Phase-8 states without reward provenance are intentionally not reusable. Latent, condition, prompt, geometry, scheduler, and policy checks remain unchanged.
+- **Online validation/config:** `online_train.py` computes the same reward provenance once, includes it in `stable_config`, forwards every reward setting/model path to `rollout.py`, and verifies both record-to-sample-state equality and equality with the current expected provenance. The prior `reward_frame_stride` stable-config entry was replaced by the complete contract, not duplicated.
+- **Real K=2 resume test:** `outputs/minimax_h3_diffusionnft_reward_provenance_phase81_20260828`, prompt 0, seeds `[0,1]`, 448x256, 22 frames, one inference step, base policy, no mp4. The initial stride-6 run generated both seeds. Repeating stride 6 produced exactly two `reuse` events and zero generation events. Changing only stride from 6 to 5 produced exactly two `reward_frame_stride mismatch` rejections, zero reuse events, and two fresh generation/reward events. Final rewards were `22.79337025` and `23.37336432`; both states contain all six fields with stride 5.
+- **Checkpoint hashes verified in artifacts:** SCRFD SHA-256 is `5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91`; MagFace SHA-256 is `30e138480978d430120c669dd95ce6786d7c87803433ec91b6c811abb331167c`. Both final seed states and rollout records agree, and `video_path` remains null.
+- **Verification:** `py312/bin/python -m py_compile` passed for both modified Python files, `bash -n` passed for the new smoke script, and `git diff --check` passed. `online_train.validate_rollout()` accepted the real two-record stride-5 rollout and rejected the same artifacts when the expected stride was changed to 6. Phase 8.1 is complete.
+
 ### 2026-08-28 — phase 8 same-environment in-memory reward and mp4-free rollout contract
 
 - **Modification goal:** move the existing SCRFD + MagFace reward inference into the MiniMax-H3 `py312` process, score H3's returned PIL frames directly, make formal online rollout independent of mp4, and replace the old `mp4 + latent` resume predicate with an atomic per-seed state contract. The verified DiffusionNFT loss, advantage/r mapping, current/old/reference policy logic, H3 schedulers/core models, old-policy rollout provenance, optimizer, checkpoint, and final-export logic are unchanged.

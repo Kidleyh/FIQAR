@@ -289,6 +289,16 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     render_width = align_up(args.width, 32)
     render_height = align_up(args.height, 32)
+    scrfd_model_path = args.scrfd_model.expanduser().resolve()
+    magface_checkpoint_path = args.magface_checkpoint.expanduser().resolve()
+    reward_provenance = {
+        "reward_frame_stride": args.reward_frame_stride,
+        "reward_max_frames": args.reward_max_frames,
+        "reward_frame_face_aggregation": args.reward_frame_face_aggregation,
+        "missing_face_reward": args.missing_face_reward,
+        "scrfd_model_sha256": _sha256(scrfd_model_path),
+        "magface_checkpoint_sha256": _sha256(magface_checkpoint_path),
+    }
     print(
         f"[rollout] prompts={len(records)} samples_per_prompt={len(seeds)} "
         f"seeds={seeds} output={args.output_dir}",
@@ -304,8 +314,8 @@ def main() -> None:
     reward_init_started = time.monotonic()
     reward_model = FaceQualityReward(
         evaluator_path=args.reward_evaluator,
-        scrfd_model=args.scrfd_model,
-        magface_checkpoint=args.magface_checkpoint,
+        scrfd_model=scrfd_model_path,
+        magface_checkpoint=magface_checkpoint_path,
         device=args.device,
     )
     reward_init_seconds = time.monotonic() - reward_init_started
@@ -367,6 +377,7 @@ def main() -> None:
                 "num_inference_steps": args.num_inference_steps,
                 "flow_shift": args.flow_shift,
                 "audio_flow_shift": args.audio_flow_shift,
+                **reward_provenance,
                 "save_rollout_video": args.save_rollout_video,
                 "video_path": str(video_path) if args.save_rollout_video else None,
             }
