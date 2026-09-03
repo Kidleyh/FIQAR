@@ -225,8 +225,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Phase 10 first version supports exactly 175 frames")
     if args.width != 1088 or args.height != 736:
         raise ValueError("Phase 10 first version supports exactly 1088x736")
-    if args.seed != 0:
-        raise ValueError("Phase 10 first version supports exactly seed=0")
     if args.policy_role == "base":
         if args.lora_path is not None or args.source_checkpoint is not None:
             raise ValueError("Base policy cannot use LoRA/source checkpoint")
@@ -886,9 +884,9 @@ def finalize(args: argparse.Namespace, record: dict[str, Any]) -> None:
         print("[phase10] oom=true stage=reward", flush=True)
         raise
     prompt_dir = Path(record["prompt_dir"])
-    latent_path = (prompt_dir / "seed_0_latents.safetensors").resolve()
+    latent_path = (prompt_dir / f"seed_{args.seed}_latents.safetensors").resolve()
     atomic_latents(latent_path, latents_cpu)
-    video_path = (prompt_dir / "seed_0.mp4").resolve()
+    video_path = (prompt_dir / f"seed_{args.seed}.mp4").resolve()
     if args.save_rollout_video:
         from diffsynth.utils.data.audio_video import write_video_audio
 
@@ -901,11 +899,11 @@ def finalize(args: argparse.Namespace, record: dict[str, Any]) -> None:
             video_quality=8,
         )
     condition_path = Path(record["condition_image_path"])
-    state_path = (prompt_dir / "seed_0_state.json").resolve()
+    state_path = (prompt_dir / f"seed_{args.seed}_state.json").resolve()
     state = {
         "format_version": 1,
         "complete": True,
-        "seed": 0,
+        "seed": args.seed,
         "reward": float(reward["reward"]),
         "mean_quality": reward["mean_quality"],
         "face_visible_ratio": float(reward["face_visible_ratio"]),
