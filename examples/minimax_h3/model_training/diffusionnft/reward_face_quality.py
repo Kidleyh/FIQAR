@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -174,19 +175,35 @@ class FaceQualityReward:
         if max_frames_per_video:
             sampled = sampled[:max_frames_per_video]
         aligned_faces: list[np.ndarray] = []
+        face_sizes: list[float] = []
+        face_size_weights: list[float] = []
         frame_face_ranges: list[tuple[int, int]] = []
         detected_face_count = 0
         for frame in sampled:
             bgr = self._frame_to_bgr(frame)
-            _, landmarks = self.detector.detect(bgr, max_num=0)
+            bboxes, landmarks = self.detector.detect(bgr, max_num=0)
             start = len(aligned_faces)
             if landmarks is not None:
+                if bboxes is None or len(bboxes) != len(landmarks):
+                    raise RuntimeError(
+                        "SCRFD returned inconsistent bbox and landmark counts"
+                    )
                 detected_face_count += len(landmarks)
-                for landmark in landmarks:
+                for bbox, landmark in zip(bboxes, landmarks):
+                    width = max(0.0, float(bbox[2]) - float(bbox[0]))
+                    height = max(0.0, float(bbox[3]) - float(bbox[1]))
+                    face_size = math.sqrt(width * height)
+                    face_size_weight = (
+                        3.0
+                        if face_size == 0.0
+                        else float(np.clip(96.0 / face_size, 1.0, 3.0))
+                    )
                     aligned = self._norm_crop(
                         bgr, landmark=np.asarray(landmark), image_size=112
                     )
                     aligned_faces.append(self._legacy_jpeg_roundtrip(aligned))
+                    face_sizes.append(face_size)
+                    face_size_weights.append(face_size_weight)
             frame_face_ranges.append((start, len(aligned_faces)))
 
         face_scores: list[float] = []
@@ -207,10 +224,15 @@ class FaceQualityReward:
         for start, end in frame_face_ranges:
             scores = face_scores[start:end]
             if scores:
+                weights = face_size_weights[start:end]
                 frame_qualities.append(
                     float(
                         {
-                            "mean": statistics.fmean(scores),
+                            "mean": sum(
+                                weight * score
+                                for weight, score in zip(weights, scores)
+                            )
+                            / sum(weights),
                             "min": min(scores),
                             "max": max(scores),
                         }[frame_face_aggregation]
@@ -228,6 +250,14 @@ class FaceQualityReward:
                 len(frame_qualities) / len(sampled) if sampled else 0.0
             ),
             "num_faces": int(detected_face_count),
+            "mean_face_size_px": (
+                float(statistics.fmean(face_sizes)) if face_sizes else None
+            ),
+            "mean_face_size_weight": (
+                float(statistics.fmean(face_size_weights))
+                if face_size_weights
+                else None
+            ),
         }
 
 

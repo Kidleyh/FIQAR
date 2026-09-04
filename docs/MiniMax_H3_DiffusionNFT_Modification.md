@@ -10,6 +10,13 @@
 
 ## Change history
 
+### 2026-09-04 — face-size-weighted MagFace aggregation (complete)
+
+- **Modification goal and scope:** reduce the formal face-quality reward's preference for large faces by giving smaller detected faces more influence. Only `examples/minimax_h3/model_training/diffusionnft/reward_face_quality.py` changed; rollout, training, DiffusionNFT loss, advantage/r, policy roles, scheduler, EMA, checkpoint, and H3 code are unchanged.
+- **Aggregation:** for every SCRFD bbox, the scorer now retains `s_i = sqrt(max(0, bbox_width_i) * max(0, bbox_height_i))` and `w_i = clip(96 / s_i, 1, 3)` (a degenerate zero-size box receives the clipped maximum 3). For `frame_face_aggregation="mean"`, the previous equal-face mean is replaced by `sum(w_i * q_i) / sum(w_i)`, where `q_i` is the unchanged MagFace embedding-norm quality. A one-face frame therefore remains exactly unchanged. Existing `min`/`max` modes, frame sampling, face detection/alignment/preprocessing, missing-face fallback, face-visible ratio, face count, and temporal arithmetic mean over scored frames remain unchanged.
+- **Additional result statistics:** `FaceQualityReward.score_frames()` now returns `mean_face_size_px` and `mean_face_size_weight`, computed across all detected/aligned faces; both are `null` when no face is found. Existing reward provenance fields and the legacy file adapter are unchanged.
+- **Verification:** Python compilation and `git diff --check` passed. A deterministic two-face check used sizes 48/192 px, qualities 10/255 and 20/255, and verified weights 2/1, exact weighted reward `0.05228758355`, mean size `120`, and mean weight `1.5`. A real py312 CUDA SCRFD/MagFace smoke on an existing 22-frame Phase-5 rollout (stride 6) returned finite reward/mean quality `22.807265152253592`, visible ratio `1.0`, nine faces, mean face size `22.040138090788567 px`, and mean face-size weight `2.989524285948718`; `REWARD_SIZE_WEIGHT_SMOKE=true`.
+
 ### 2026-09-04 — phase 12 eight-GPU large-video online DiffusionNFT (complete)
 
 - **Modification goal and scope:** verify the existing Phase-11 online state machine at 8xH100 with 1088x736, 175 frames, K=8 seeds `0..7`, eight-rank ZeRO-3 rollout for every individual seed, and eight-rank ZeRO-3 NFT training. Seeds remain sequential and each video uses all eight GPUs; no 4x2 rollout scheduler, parallel multi-seed generation, new loss, scheduler change, CPU offload, sequence/context parallelism, or alternate distributed framework was introduced.
