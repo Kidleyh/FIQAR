@@ -34,8 +34,8 @@ REWARD_MAX_FRAMES="${REWARD_MAX_FRAMES:-0}"
 REWARD_FRAME_FACE_AGGREGATION="${REWARD_FRAME_FACE_AGGREGATION:-mean}"
 MISSING_FACE_REWARD="${MISSING_FACE_REWARD:-0.0}"
 
-if [[ "${NUM_PROCESSES}" != "2" ]]; then
-  echo "Phase 10 requires NUM_PROCESSES=2" >&2
+if (( NUM_PROCESSES < 2 )); then
+  echo "ZeRO-3 rollout requires NUM_PROCESSES>=2" >&2
   exit 2
 fi
 
@@ -47,6 +47,7 @@ COMMON_ARGS=(
   --height "${HEIGHT}"
   --num-frames "${NUM_FRAMES}"
   --num-inference-steps "${NUM_INFERENCE_STEPS}"
+  --rollout-world-size "${NUM_PROCESSES}"
   --seed "${SEED}"
   --flow-shift "${FLOW_SHIFT}"
   --audio-flow-shift "${AUDIO_FLOW_SHIFT}"

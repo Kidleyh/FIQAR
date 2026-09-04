@@ -329,6 +329,8 @@ def validate_merged_records(
         "scrfd_model_sha256",
         "magface_checkpoint_sha256",
         "reward_backend",
+        "rollout_world_size",
+        "rollout_zero_stage",
     )
     for key in common_keys:
         common_value(records, key)
@@ -342,6 +344,8 @@ def validate_merged_records(
         "num_inference_steps": args.num_inference_steps,
         "flow_shift": args.flow_shift,
         "audio_flow_shift": args.audio_flow_shift,
+        "rollout_world_size": args.rollout_world_size,
+        "rollout_zero_stage": 3,
     }
     for key, expected in geometry.items():
         if common_value(records, key) != expected:

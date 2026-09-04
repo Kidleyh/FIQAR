@@ -97,7 +97,7 @@ class Zero3RolloutModule(torch.nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MiniMax-H3 single-seed rollout using a two-rank ZeRO-3 DiT."
+        description="MiniMax-H3 single-seed rollout using a multi-rank ZeRO-3 DiT."
     )
     parser.add_argument(
         "--mode",
@@ -114,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1088)
     parser.add_argument("--num-frames", default="175")
     parser.add_argument("--num-inference-steps", type=int, default=3)
+    parser.add_argument("--rollout-world-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--negative-prompt", default=NEGATIVE_PROMPT)
@@ -216,6 +217,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--start and --seed must be non-negative")
     if args.num_inference_steps <= 0:
         raise ValueError("--num-inference-steps must be positive")
+    if args.rollout_world_size <= 1:
+        raise ValueError("--rollout-world-size must be at least 2")
     if args.cfg_scale != 1.0:
         raise ValueError("Phase 10 first version supports the verified cfg_scale=1 only")
     if args.lora_rank <= 0:
@@ -342,6 +345,7 @@ def contract(args: argparse.Namespace, record: dict[str, Any]) -> dict[str, Any]
         "tiled": not args.no_tiled,
         "tile_size": args.tile_size,
         "tile_overlap": args.tile_overlap,
+        "rollout_world_size": args.rollout_world_size,
     }
 
 
@@ -551,9 +555,9 @@ def denoise(args: argparse.Namespace, record: dict[str, Any]) -> None:
     plugin = accelerator.state.deepspeed_plugin
     plugin.deepspeed_config["gradient_clipping"] = 1.0
     zero_stage = int(plugin.deepspeed_config["zero_optimization"]["stage"])
-    if accelerator.num_processes != 2 or zero_stage != 3:
+    if accelerator.num_processes != args.rollout_world_size or zero_stage != 3:
         raise RuntimeError(
-            f"Phase 10 requires world_size=2 and ZeRO-3, got "
+            f"Requested world_size={args.rollout_world_size} with ZeRO-3, got "
             f"{accelerator.num_processes}/{zero_stage}"
         )
     zero3.rank_log(
@@ -759,8 +763,11 @@ def validate_denoise_state(
             raise ValueError(f"Denoise state mismatch for {key}")
     if state.get("complete") is not True:
         raise ValueError("Denoise state is not complete")
-    if state.get("world_size") != 2 or state.get("zero_stage") != 3:
-        raise ValueError("Denoise state is not a two-rank ZeRO-3 result")
+    if (
+        state.get("world_size") != args.rollout_world_size
+        or state.get("zero_stage") != 3
+    ):
+        raise ValueError("Denoise state does not match requested ZeRO-3 world size")
     if state.get("all_ranks_executed_timesteps") != args.num_inference_steps:
         raise ValueError("Not all ranks completed every timestep")
     latent_path = Path(state["clean_latent_path"])
@@ -936,7 +943,7 @@ def finalize(args: argparse.Namespace, record: dict[str, Any]) -> None:
         "fps": H3_FPS,
         "reward_backend": "in_memory",
         "rollout_backend": "accelerate-deepspeed-zero3",
-        "rollout_world_size": 2,
+        "rollout_world_size": args.rollout_world_size,
         "rollout_zero_stage": 3,
         "rank_peak_allocated_mb": denoise_state["rank_peak_allocated_mb"],
         "rank_peak_reserved_mb": denoise_state["rank_peak_reserved_mb"],
